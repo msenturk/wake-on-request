@@ -167,11 +167,12 @@ run_dry_run() {
     section "Files"
     for entry in "${FILES[@]}"; do
         local local_path="${entry%%:*}"
+        local remote_file="$(basename "$local_path")"
         if [ ! -f "$local_path" ]; then
             if [ "$local_path" = "npm-custom/server_proxy.conf" ]; then
                 change "Write     $local_path   ← bundled in install.sh"
             else
-                change "Download  $local_path   ← $RAW_BASE/$local_path"
+                change "Download  $local_path   ← $RAW_BASE/$remote_file"
             fi
             any_change=true
         else
@@ -569,7 +570,8 @@ run_install() {
 
     for entry in "${FILES[@]}"; do
         local local_path="${entry%%:*}"
-        local url="$RAW_BASE/$local_path"
+        local remote_file="$(basename "$local_path")"
+        local url="$RAW_BASE/$remote_file"
 
         # server_proxy.conf is embedded — skip curl for it
         if [ "$local_path" = "npm-custom/server_proxy.conf" ]; then
