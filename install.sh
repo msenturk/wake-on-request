@@ -514,7 +514,79 @@ resolve_compose_file() {
     echo "$fallback"
 }
 
-# ── Bundled file fallback ──────────────────────────────────────────────────────
+# ── Python-based container inspector ─────────────────────────────────────────
+# Calls `docker inspect <id>` for a single container and uses Python's stdlib
+# json module to extract all needed fields into a safe, pipe-delimited record.
+# Never uses --format Go templates, so it handles any value (ports, labels, paths)
+# without the multi-line bleeding bug.
+# Output: name|status|restart|netmode|enabled|domain|idle|start|port_label|
+#         config_files|working_dir|svc_name|network_ids|exposed_ports|
+#         published_ports|ips|long_id|mounts
+inspect_container_python() {
+    local cid="$1"
+    $DOCKER_CMD inspect "$cid" 2>/dev/null | python3 - <<'PYEOF'
+import json, sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+if not data:
+    sys.exit(0)
+
+c = data[0]
+labels = c.get("Config", {}).get("Labels") or {}
+net_settings = c.get("NetworkSettings", {})
+networks = net_settings.get("Networks") or {}
+ports_map = net_settings.get("Ports") or {}
+mounts = c.get("Mounts") or []
+hostconfig = c.get("HostConfig", {})
+
+name       = c.get("Name", "").lstrip("/")
+status     = c.get("State", {}).get("Status", "")
+restart    = hostconfig.get("RestartPolicy", {}).get("Name", "")
+netmode    = hostconfig.get("NetworkMode", "")
+enabled    = labels.get("wakeonrequest.enable", "")
+domain     = labels.get("wakeonrequest.domain", "")
+idle       = labels.get("wakeonrequest.idle_timeout", "")
+start      = labels.get("wakeonrequest.start_timeout", "")
+port_label = labels.get("wakeonrequest.port", "")
+config_f   = labels.get("com.docker.compose.project.config_files", "")
+working_d  = labels.get("com.docker.compose.project.working_dir", "")
+svc_name   = labels.get("com.docker.compose.service", "")
+long_id    = c.get("Id", "")
+
+net_ids = " ".join(v.get("NetworkID", "") for v in networks.values())
+ips     = " ".join(v.get("IPAddress", "") for v in networks.values())
+
+# Ports: exposed = keys of ports_map; published = host ports from bindings
+exposed    = " ".join(k for k in ports_map)
+published  = " ".join(
+    b["HostPort"]
+    for bindings in ports_map.values()
+    if bindings
+    for b in bindings
+    if b and b.get("HostPort")
+)
+
+# Mounts: bind-mounts only (skip anonymous volumes)
+mount_sources = "?".join(
+    m.get("Source", "")
+    for m in mounts
+    if m.get("Source")
+)
+
+fields = [name, status, restart, netmode, enabled, domain, idle, start,
+          port_label, config_f, working_d, svc_name, net_ids, exposed,
+          published, ips, long_id, mount_sources]
+
+# Replace any embedded | with ▒ to keep the record safe
+print("|".join(f.replace("|", "▒") for f in fields))
+PYEOF
+}
+
+ ──────────────────────────────────────────────────────
 # server_proxy.conf is not hosted on GitHub — it is embedded here instead.
 # Called by both run_dry_run (for missing files) and run_install (as fallback).
 write_bundled_files() {
@@ -602,15 +674,14 @@ run_dry_run() {
         fi
 
         if [ -n "$container_ids" ]; then
-            local inspect_data
-            inspect_data=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.working_dir"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{.Id}}|{{range .Mounts}}{{.Source}}?{{end}}' $container_ids 2>/dev/null || true)
-
-            while IFS= read -r details; do
+            for cid in $container_ids; do
+                local details
+                details=$(inspect_container_python "$cid")
                 [ -z "$details" ] && continue
 
-                # Parse fields
-                local cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks raw_ports ips long_id mounts
-                IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks raw_ports ips long_id mounts <<< "$details"
+                # Parse fields (produced cleanly by Python)
+                local cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks exposed_ports published_ports ips long_id mounts
+                IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks exposed_ports published_ports ips long_id mounts <<< "$details"
 
                 local is_npm=false
                 if [ -n "$npm_id" ]; then
@@ -620,178 +691,160 @@ run_dry_run() {
                 fi
                 [ "$is_npm" = true ] && continue
 
-                cname="${cname#/}"
+                # No <no value> cleanup needed — Python returns empty strings
 
-            # Strip "<no value>" strings from labels (for older docker engines/podman)
-            enabled="${enabled#<no value>}"
-            domain="${domain#<no value>}"
-            idle="${idle#<no value>}"
-            start="${start#<no value>}"
-            port_label="${port_label#<no value>}"
-            compose_file="${compose_file#<no value>}"
-            working_dir="${working_dir#<no value>}"
-            svc_name="${svc_name#<no value>}"
+                local compose_path
+                compose_path=$(resolve_compose_file "$compose_file" "$working_dir" "$mounts")
 
-            local compose_path
-            compose_path=$(resolve_compose_file "$compose_file" "$working_dir" "$mounts")
+                # Trim whitespace from port/ip lists (Python may have trailing spaces)
+                exposed_ports=$(echo "$exposed_ports" | xargs)
+                published_ports=$(echo "$published_ports" | xargs)
+                ips=$(echo "$ips" | xargs)
 
-            # Parse exposed and published ports from raw_ports
-            local exposed_ports="" published_ports=""
-            if [ -n "$raw_ports" ]; then
-                raw_ports="${raw_ports#<no value>}"
-                if [ -n "$raw_ports" ] && [ "$raw_ports" != "map[]" ]; then
-                    exposed_ports=$(echo "$raw_ports" | grep -oE '[0-9]+/(tcp|udp)' | tr '\n' ' ' || echo "")
-                    published_ports=$(echo "$raw_ports" | grep -oE '[0-9]+\}' | tr -d '}' | tr '\n' ' ' || echo "")
-                fi
-            fi
-
-            echo ""
-            # ── Already configured ────────────────────────────────────────────
-            if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
-                idle="${idle:-300}"
-                start="${start:-30}"
-                if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
-                    warn "${BOLD}$cname${NC}${YELLOW}  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
-                    err "      restart: \"$restart\" prevents idle stop → must be changed to \"no\" manually in docker-compose.yml"
-                else
-                    ok "${BOLD}$cname${NC}${GREEN}  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
-                fi
-                continue
-            fi
-
-            if [ "$enabled" = "true" ] && [ -z "$domain" ]; then
-                warn "${BOLD}$cname${NC}${YELLOW}  →  wakeonrequest.enable=true but MISSING wakeonrequest.domain label!"
-                continue
-            fi
-
-            # ── Not yet configured — detect everything ────────────────────────
-
-            # Detect exposed port (prefer label > single exposed port > published port)
-            local detected_port="" port_source=""
-            
-            # Clean exposed/published ports & ips
-            exposed_ports=$(echo "$exposed_ports" | xargs)
-            published_ports=$(echo "$published_ports" | xargs)
-            ips=$(echo "$ips" | xargs)
-
-            # Count exposed/published ports
-            local exp_count pub_count
-            exp_count=$(echo "$exposed_ports" | wc -w)
-            pub_count=$(echo "$published_ports" | wc -w)
-
-            local single_exposed=""
-            if [ "$exp_count" -eq 1 ]; then
-                single_exposed="${exposed_ports%%/*}"
-            fi
-
-            local single_published=""
-            if [ "$pub_count" -eq 1 ]; then
-                single_published="${published_ports}"
-            fi
-
-            # Match against NPM SQLite database
-            local matched_domain="" matched_port="" matched_fwd_host="" matched_access_type=""
-            find_npm_config_for_container "$cname" "$ips" "$published_ports" || true
-
-            if [ -n "$port_label" ]; then
-                detected_port="$port_label"
-                port_source="from label"
-            elif [ -n "$matched_port" ]; then
-                detected_port="$matched_port"
-                port_source="from NPM database"
-            elif [ -n "$single_exposed" ]; then
-                detected_port="$single_exposed"
-                port_source="auto-detected"
-            elif [ -n "$single_published" ]; then
-                detected_port="$single_published"
-                port_source="published port"
-            else
-                detected_port=""
-                port_source=""
-            fi
-
-            # Determine if this container shares a network with NPM
-            local shares_network=false
-            for net in $npm_networks; do
-                for cnet in $networks; do
-                    if [ "$net" = "$cnet" ]; then
-                        shares_network=true
-                        break 2
+                # ── Already configured ─────────────────────────────────────
+                if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
+                    idle="${idle:-300}"
+                    start="${start:-30}"
+                    if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+                        warn "${BOLD}$cname${NC}${YELLOW}  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
+                        err "      restart: \"$restart\" prevents idle stop → must be changed to \"no\" manually in docker-compose.yml"
+                    else
+                        ok "${BOLD}$cname${NC}${GREEN}  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
                     fi
-                done
-            done
-
-            # Decide Forward Host recommendation
-            local fwd_host fwd_port fwd_note restart_needed
-            if [ -n "$matched_fwd_host" ]; then
-                fwd_host="$matched_fwd_host"
-                fwd_port="$matched_port"
-                if [ "$matched_access_type" = "name" ]; then
-                    fwd_note="NPM database config — accesses via container name"
-                    port_source="from NPM database"
-                else
-                    fwd_note="NPM database config — accesses via IP"
-                    port_source="from NPM database"
+                    continue
                 fi
-            elif [ "$network" = "host" ]; then
-                fwd_host=$(detect_host_ip)
-                fwd_port="${single_published:-<port>}"
-                fwd_note="host network — NPM cannot route by name"
-            elif [ "$shares_network" = "true" ]; then
-                fwd_host="$cname"
-                fwd_port="${detected_port:-<port>}"
-                fwd_note="same network as NPM — use container name"
-            else
-                fwd_host=$(detect_host_ip)
-                fwd_port="${single_published:-<port>}"
-                fwd_note="different network from NPM — use host IP"
-            fi
 
-            restart_needed=false
-            if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
-                restart_needed=true
-            fi
+                if [ "$enabled" = "true" ] && [ -z "$domain" ]; then
+                    warn "${BOLD}$cname${NC}${YELLOW}  →  wakeonrequest.enable=true but MISSING wakeonrequest.domain label!"
+                    continue
+                fi
 
-            # ── Print tailored block ──────────────────────────────────────────
-            local status_tag="state: $state | restart: $restart"
-            [ "$network" = "host" ] && status_tag="$status_tag | network: host"
+                # ── Not yet configured — detect everything ─────────────────
 
-            echo -e "  ${YELLOW}➕ ${BOLD}$cname${NC}  [$status_tag]"
+                local exp_count pub_count
+                exp_count=$(echo "$exposed_ports" | wc -w)
+                pub_count=$(echo "$published_ports" | wc -w)
 
-            if [ "$restart_needed" = "true" ]; then
-                err "restart: \"$restart\" prevents idle stop → must be changed to \"no\""
-            fi
+                local single_exposed=""
+                [ "$exp_count" -eq 1 ] && single_exposed="${exposed_ports%%/*}"
 
-            echo ""
-            echo -e "     ${BOLD}── NPM Proxy Host settings ──${NC}"
-            echo -e "     Forward Host : ${GREEN}$fwd_host${NC}"
-            if [ -n "$fwd_port" ] && [ "$fwd_port" != "<port>" ]; then
-                echo -e "     Forward Port : ${GREEN}$fwd_port${NC}  ${BLUE}($port_source)${NC}"
-            else
-                echo -e "     Forward Port : ${YELLOW}<set manually>${NC}  ${BLUE}(could not auto-detect)${NC}"
-            fi
-            echo -e "     Note         : ${BLUE}$fwd_note${NC}"
+                local single_published=""
+                [ "$pub_count" -eq 1 ] && single_published="${published_ports}"
 
-            echo ""
-            local label_domain="<your-domain.example.com>"
-            if [ -n "$matched_domain" ]; then
-                label_domain="$matched_domain"
-            elif [ -n "$domain" ]; then
-                label_domain="$domain"
-            fi
+                local matched_domain="" matched_port="" matched_fwd_host="" matched_access_type=""
+                find_npm_config_for_container "$cname" "$ips" "$published_ports" || true
 
-            local ip_labels=""
-            if [[ "$fwd_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                ip_labels="     ${GREEN}  - \"wakeonrequest.probe_host=${fwd_host}\"${NC}\n     ${GREEN}  - \"wakeonrequest.port=${fwd_port}\"${NC}"
-            fi
+                local detected_port="" port_source=""
+                if [ -n "$port_label" ]; then
+                    detected_port="$port_label"; port_source="from label"
+                elif [ -n "$matched_port" ]; then
+                    detected_port="$matched_port"; port_source="from NPM database"
+                elif [ -n "$single_exposed" ]; then
+                    detected_port="$single_exposed"; port_source="auto-detected"
+                elif [ -n "$single_published" ]; then
+                    detected_port="$single_published"; port_source="published port"
+                fi
 
-            if [ -n "$compose_path" ] && [ -f "$compose_path" ]; then
-                if grep -qF "wakeonrequest.enable" "$compose_path"; then
-                    ok "Compose File : ${GREEN}Already configured${NC} in ${BLUE}$compose_path${NC}"
+                # Determine if this container shares a network with NPM
+                local shares_network=false
+                for net in $npm_networks; do
+                    for cnet in $networks; do
+                        if [ "$net" = "$cnet" ]; then
+                            shares_network=true
+                            break 2
+                        fi
+                    done
+                done
+
+                # Decide Forward Host recommendation
+                local fwd_host fwd_port fwd_note restart_needed
+                if [ -n "$matched_fwd_host" ]; then
+                    fwd_host="$matched_fwd_host"
+                    fwd_port="$matched_port"
+                    if [ "$matched_access_type" = "name" ]; then
+                        fwd_note="NPM database config — accesses via container name"
+                        port_source="from NPM database"
+                    else
+                        fwd_note="NPM database config — accesses via IP"
+                        port_source="from NPM database"
+                    fi
+                elif [ "$network" = "host" ]; then
+                    fwd_host=$(detect_host_ip)
+                    fwd_port="${single_published:-<port>}"
+                    fwd_note="host network — NPM cannot route by name"
+                elif [ "$shares_network" = "true" ]; then
+                    fwd_host="$cname"
+                    fwd_port="${detected_port:-<port>}"
+                    fwd_note="same network as NPM — use container name"
                 else
-                    change "Compose File : ${YELLOW}Will patch${NC} at ${BLUE}$compose_path${NC}"
+                    fwd_host=$(detect_host_ip)
+                    fwd_port="${single_published:-<port>}"
+                    fwd_note="different network from NPM — use host IP"
+                fi
+
+                restart_needed=false
+                if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+                    restart_needed=true
+                fi
+
+                # ── Print tailored block ──────────────────────────────────────────
+                local status_tag="state: $state | restart: $restart"
+                [ "$network" = "host" ] && status_tag="$status_tag | network: host"
+
+                echo -e "  ${YELLOW}➕ ${BOLD}$cname${NC}  [$status_tag]"
+
+                if [ "$restart_needed" = "true" ]; then
+                    err "restart: \"$restart\" prevents idle stop → must be changed to \"no\""
+                fi
+
+                echo ""
+                echo -e "     ${BOLD}── NPM Proxy Host settings ──${NC}"
+                echo -e "     Forward Host : ${GREEN}$fwd_host${NC}"
+                if [ -n "$fwd_port" ] && [ "$fwd_port" != "<port>" ]; then
+                    echo -e "     Forward Port : ${GREEN}$fwd_port${NC}  ${BLUE}($port_source)${NC}"
+                else
+                    echo -e "     Forward Port : ${YELLOW}<set manually>${NC}  ${BLUE}(could not auto-detect)${NC}"
+                fi
+                echo -e "     Note         : ${BLUE}$fwd_note${NC}"
+
+                echo ""
+                local label_domain="<your-domain.example.com>"
+                if [ -n "$matched_domain" ]; then
+                    label_domain="$matched_domain"
+                elif [ -n "$domain" ]; then
+                    label_domain="$domain"
+                fi
+
+                local ip_labels=""
+                if [[ "$fwd_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    ip_labels="     ${GREEN}  - \"wakeonrequest.probe_host=${fwd_host}\"${NC}\n     ${GREEN}  - \"wakeonrequest.port=${fwd_port}\"${NC}"
+                fi
+
+                if [ -n "$compose_path" ] && [ -f "$compose_path" ]; then
+                    if grep -qF "wakeonrequest.enable" "$compose_path"; then
+                        ok "Compose File : ${GREEN}Already configured${NC} in ${BLUE}$compose_path${NC}"
+                    else
+                        change "Compose File : ${YELLOW}Will patch${NC} at ${BLUE}$compose_path${NC}"
+                        echo ""
+                        echo -e "     ${BOLD}── Proposed changes for $compose_path (Method A) ──${NC}"
+                        echo ""
+                        if [ "$restart_needed" = "true" ]; then
+                            echo -e "     ${YELLOW}restart: \"no\"${NC}                                  ${BLUE}# change from: $restart${NC}"
+                        fi
+                        echo -e "     ${GREEN}labels:${NC}"
+                        echo -e "     ${GREEN}  - \"wakeonrequest.enable=true\"${NC}"
+                        echo -e "     ${GREEN}  - \"wakeonrequest.domain=${label_domain}\"${NC}  ${BLUE}# ← your NPM domain${NC}"
+                        echo -e "     ${GREEN}  - \"wakeonrequest.idle_timeout=300\"${NC}                  ${BLUE}# stop after 5 min idle${NC}"
+                        echo -e "     ${GREEN}  - \"wakeonrequest.start_timeout=30\"${NC}                  ${BLUE}# wait up to 30s on wake${NC}"
+                        if [ -n "$ip_labels" ]; then
+                            echo -e "$ip_labels"
+                        fi
+                        echo ""
+                    fi
+                else
+                    warn "Compose File : ${RED}Not found${NC} (checked: ${YELLOW}${compose_path:-none}${NC})"
                     echo ""
-                    echo -e "     ${BOLD}── Proposed changes for $compose_path (Method A) ──${NC}"
+                    echo -e "     ${BOLD}── Add to $cname's docker-compose.yml manually (Method A) ──${NC}"
                     echo ""
                     if [ "$restart_needed" = "true" ]; then
                         echo -e "     ${YELLOW}restart: \"no\"${NC}                                  ${BLUE}# change from: $restart${NC}"
@@ -806,37 +859,19 @@ run_dry_run() {
                     fi
                     echo ""
                 fi
-            else
-                warn "Compose File : ${RED}Not found${NC} (checked: ${YELLOW}${compose_path:-none}${NC})"
-                echo ""
-                echo -e "     ${BOLD}── Add to $cname's docker-compose.yml manually (Method A) ──${NC}"
-                echo ""
-                if [ "$restart_needed" = "true" ]; then
-                    echo -e "     ${YELLOW}restart: \"no\"${NC}                                  ${BLUE}# change from: $restart${NC}"
-                fi
-                echo -e "     ${GREEN}labels:${NC}"
-                echo -e "     ${GREEN}  - \"wakeonrequest.enable=true\"${NC}"
-                echo -e "     ${GREEN}  - \"wakeonrequest.domain=${label_domain}\"${NC}  ${BLUE}# ← your NPM domain${NC}"
-                echo -e "     ${GREEN}  - \"wakeonrequest.idle_timeout=300\"${NC}                  ${BLUE}# stop after 5 min idle${NC}"
-                echo -e "     ${GREEN}  - \"wakeonrequest.start_timeout=30\"${NC}                  ${BLUE}# wait up to 30s on wake${NC}"
-                if [ -n "$ip_labels" ]; then
-                    echo -e "$ip_labels"
-                fi
-                echo ""
-            fi
 
-            # ── NPM Advanced Tab Config (Method B) ──
-            echo -e "     ${BOLD}── NPM Advanced Tab Config (Method B) ──${NC}"
-            echo ""
-            echo -e "     ${GREEN}set \$wake_container     \"${cname}\";${NC}"
-            echo -e "     ${GREEN}set \$wake_idle_timeout  300;${NC}"
-            echo -e "     ${GREEN}set \$wake_start_timeout 30;${NC}"
-            if [[ "$fwd_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                echo -e "     ${GREEN}set \$wake_probe_host    \"${fwd_host}\";${NC}       ${BLUE}# cross-network probe IP${NC}"
-                echo -e "     ${GREEN}set \$wake_port          ${fwd_port:-80};${NC}    ${BLUE}# cross-network probe port${NC}"
-            fi
-            echo ""
-            done <<< "$inspect_data"
+                # ── NPM Advanced Tab Config (Method B) ──
+                echo -e "     ${BOLD}── NPM Advanced Tab Config (Method B) ──${NC}"
+                echo ""
+                echo -e "     ${GREEN}set \$wake_container     \"${cname}\";${NC}"
+                echo -e "     ${GREEN}set \$wake_idle_timeout  300;${NC}"
+                echo -e "     ${GREEN}set \$wake_start_timeout 30;${NC}"
+                if [[ "$fwd_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    echo -e "     ${GREEN}set \$wake_probe_host    \"${fwd_host}\";${NC}       ${BLUE}# cross-network probe IP${NC}"
+                    echo -e "     ${GREEN}set \$wake_port          ${fwd_port:-80};${NC}    ${BLUE}# cross-network probe port${NC}"
+                fi
+                echo ""
+            done
         fi
     else
         warn "Docker socket or daemon not available — skipping container scan."
@@ -902,15 +937,14 @@ configure_app_containers() {
     local any_unmanaged=false
 
     if [ -n "$container_ids" ]; then
-        local inspect_data
-        inspect_data=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.working_dir"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{.Id}}|{{range .Mounts}}{{.Source}}?{{end}}' $container_ids 2>/dev/null || true)
-
-        while IFS= read -r details; do
+        for cid in $container_ids; do
+            local details
+            details=$(inspect_container_python "$cid")
             [ -z "$details" ] && continue
 
-            # Parse fields
-            local cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks raw_ports ips long_id mounts
-            IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks raw_ports ips long_id mounts <<< "$details"
+            # Parse fields (clean pipe-delimited output from Python)
+            local cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks exposed_ports published_ports ips long_id mounts
+            IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file working_dir svc_name networks exposed_ports published_ports ips long_id mounts <<< "$details"
 
             local is_npm=false
             if [ -n "$npm_id" ]; then
@@ -920,68 +954,43 @@ configure_app_containers() {
             fi
             [ "$is_npm" = true ] && continue
 
-            cname="${cname#/}"
+            # No <no value> cleanup needed — Python returns empty strings
 
-        # Strip "<no value>" strings from labels (for older docker engines/podman)
-        enabled="${enabled#<no value>}"
-        domain="${domain#<no value>}"
-        idle="${idle#<no value>}"
-        start="${start#<no value>}"
-        port_label="${port_label#<no value>}"
-        compose_file="${compose_file#<no value>}"
-        working_dir="${working_dir#<no value>}"
-        svc_name="${svc_name#<no value>}"
+            local compose_path
+            compose_path=$(resolve_compose_file "$compose_file" "$working_dir" "$mounts")
 
-        local compose_path
-        compose_path=$(resolve_compose_file "$compose_file" "$working_dir" "$mounts")
+            # Trim whitespace
+            exposed_ports=$(echo "$exposed_ports" | xargs)
+            published_ports=$(echo "$published_ports" | xargs)
+            ips=$(echo "$ips" | xargs)
 
-        # Parse exposed and published ports from raw_ports
-        local exposed_ports="" published_ports=""
-        if [ -n "$raw_ports" ]; then
-            raw_ports="${raw_ports#<no value>}"
-            if [ -n "$raw_ports" ] && [ "$raw_ports" != "map[]" ]; then
-                exposed_ports=$(echo "$raw_ports" | grep -oE '[0-9]+/(tcp|udp)' | tr '\n' ' ' || echo "")
-                published_ports=$(echo "$raw_ports" | grep -oE '[0-9]+\}' | tr -d '}' | tr '\n' ' ' || echo "")
+            # Skip already-configured containers
+            if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
+                idle="${idle:-300}"
+                start="${start:-30}"
+                if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+                    warn "${BOLD}$cname${NC}${YELLOW}  already configured  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
+                    err "      restart: \"$restart\" must be changed to \"no\" manually in docker-compose.yml"
+                else
+                    ok "${BOLD}$cname${NC}${GREEN}  already configured  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
+                fi
+                continue
             fi
-        fi
 
-        # Skip already-configured containers
-        if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
-            idle="${idle:-300}"
-            start="${start:-30}"
-            if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
-                warn "${BOLD}$cname${NC}${YELLOW}  already configured  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
-                err "      restart: \"$restart\" must be changed to \"no\" manually in docker-compose.yml"
-            else
-                ok "${BOLD}$cname${NC}${GREEN}  already configured  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
-            fi
-            continue
-        fi
+            any_unmanaged=true
 
-        any_unmanaged=true
+            # Count exposed/published ports
+            local exp_count pub_count
+            exp_count=$(echo "$exposed_ports" | wc -w)
+            pub_count=$(echo "$published_ports" | wc -w)
 
-        # Detect exposed port (prefer label > single exposed port > published port)
-        local detected_port="" port_source=""
-        
-        # Clean exposed/published ports & ips
-        exposed_ports=$(echo "$exposed_ports" | xargs)
-        published_ports=$(echo "$published_ports" | xargs)
-        ips=$(echo "$ips" | xargs)
+            local single_exposed=""
+            [ "$exp_count" -eq 1 ] && single_exposed="${exposed_ports%%/*}"
 
-        # Count exposed/published ports
-        local exp_count pub_count
-        exp_count=$(echo "$exposed_ports" | wc -w)
-        pub_count=$(echo "$published_ports" | wc -w)
+            local single_published=""
+            [ "$pub_count" -eq 1 ] && single_published="${published_ports}"
 
-        local single_exposed=""
-        if [ "$exp_count" -eq 1 ]; then
-            single_exposed="${exposed_ports%%/*}"
-        fi
-
-        local single_published=""
-        if [ "$pub_count" -eq 1 ]; then
-            single_published="${published_ports}"
-        fi
+            local detected_port="" port_source=""
 
         local user_domain=""
         local default_domain=""

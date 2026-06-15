@@ -18,3 +18,5 @@ __pycache__/
 # Manual test runtime data
 manual-test/data/
 .serena
+_patch_wsl_path.py
+_patch_fstrings.py
