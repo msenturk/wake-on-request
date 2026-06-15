@@ -273,16 +273,7 @@ find_npm_container_id() {
         
         # Fallback to scanning all containers
         if [ -z "$npm_cid" ]; then
-            local container_ids
-            container_ids=$($DOCKER_CMD ps -a -q || true)
-            for cid in $container_ids; do
-                local img
-                img=$($DOCKER_CMD inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)
-                if echo "$img" | grep -q "nginx-proxy-manager"; then
-                    npm_cid="$cid"
-                    break
-                fi
-            done
+            npm_cid=$($DOCKER_CMD ps -a --format '{{.ID}}|{{.Image}}' 2>/dev/null | grep "nginx-proxy-manager" | head -n1 | cut -d'|' -f1 || echo "")
         fi
     fi
     echo "$npm_cid"
@@ -425,70 +416,6 @@ scan_docker_environment() {
         return
     fi
 
-    fetch_npm_proxy_hosts
-
-    local container_ids npm_id npm_networks
-    container_ids=$($DOCKER_CMD ps -a -q || true)
-
-    # Find NPM container
-    npm_id=$(find_npm_container_id)
-
-    if [ -n "$npm_id" ]; then
-        npm_networks=$($DOCKER_CMD inspect --format '{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' "$npm_id" 2>/dev/null || true)
-    fi
-
-    local restart_warning=""
-    local isolated=""
-
-    for cid in $container_ids; do
-        [ "$cid" = "$npm_id" ] && continue
-
-        # Inspect container
-        local details
-        details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' "$cid" 2>/dev/null || true)
-        [ -z "$details" ] && continue
-
-        # Parse fields
-        local cname restart network networks
-        IFS='|' read -r cname restart network networks <<< "$details"
-        cname="${cname#/}"
-
-        # 1. Check restart policy
-        if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
-            restart_warning="${restart_warning}    ${cname}  [restart: ${restart}]\n"
-        fi
-
-        # 2. Check network membership
-        # Skip host network containers
-        if [ "$network" != "host" ]; then
-            local shares_network=false
-            for net in $npm_networks; do
-                for cnet in $networks; do
-                    if [ "$net" = "$cnet" ]; then
-                        shares_network=true
-                        break 2
-                    fi
-                done
-            done
-
-            if [ "$shares_network" = false ]; then
-                isolated="${isolated}    ${cname}\n"
-            fi
-        fi
-    done
-
-    if [ -n "$restart_warning" ]; then
-        warn "These containers have auto-restart enabled, which PREVENTS Wake-On-Request"
-        warn "from stopping them. Change restart to \"no\" in their docker-compose.yml:"
-        echo -e "$restart_warning"
-    fi
-
-    if [ -n "$isolated" ]; then
-        warn "These containers are on a DIFFERENT network than NPM."
-        info "For these, set NPM Forward Host to your Docker Host IP."
-        echo -e "$isolated"
-    fi
-
     ok "Environment scan complete."
 }
 
@@ -579,19 +506,26 @@ run_dry_run() {
             npm_networks=$($DOCKER_CMD inspect --format '{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}' "$npm_id" 2>/dev/null || true)
         fi
 
-        for cid in $container_ids; do
-            [ "$cid" = "$npm_id" ] && continue
+        if [ -n "$container_ids" ]; then
+            local inspect_data
+            inspect_data=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{.Id}}' $container_ids 2>/dev/null || true)
 
-            # Get container details via Go Template (including IPAddress)
-            local details
-            details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$cid" 2>/dev/null || true)
+            while IFS= read -r details; do
+                [ -z "$details" ] && continue
 
-            [ -z "$details" ] && continue
+                # Parse fields
+                local cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips long_id
+                IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips long_id <<< "$details"
 
-            # Parse fields
-            local cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips
-            IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips <<< "$details"
-            cname="${cname#/}"
+                local is_npm=false
+                if [ -n "$npm_id" ]; then
+                    if [ "$long_id" = "$npm_id" ] || [ "${long_id:0:12}" = "$npm_id" ] || [ "$cname" = "/$npm_id" ]; then
+                        is_npm=true
+                    fi
+                fi
+                [ "$is_npm" = true ] && continue
+
+                cname="${cname#/}"
 
             # Strip "<no value>" strings from labels (for older docker engines/podman)
             enabled="${enabled#<no value>}"
@@ -617,7 +551,12 @@ run_dry_run() {
             if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
                 idle="${idle:-300}"
                 start="${start:-30}"
-                ok "${BOLD}$cname${NC}${GREEN}  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
+                if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+                    warn "${BOLD}$cname${NC}${YELLOW}  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
+                    err "      restart: \"$restart\" prevents idle stop → must be changed to \"no\" manually in docker-compose.yml"
+                else
+                    ok "${BOLD}$cname${NC}${GREEN}  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
+                fi
                 continue
             fi
 
@@ -807,7 +746,8 @@ run_dry_run() {
                 echo -e "     ${GREEN}set \$wake_port          ${fwd_port:-80};${NC}    ${BLUE}# cross-network probe port${NC}"
             fi
             echo ""
-        done
+            done <<< "$inspect_data"
+        fi
     else
         warn "Docker socket or daemon not available — skipping container scan."
     fi
@@ -871,19 +811,26 @@ configure_app_containers() {
 
     local any_unmanaged=false
 
-    for cid in $container_ids; do
-        [ "$cid" = "$npm_id" ] && continue
+    if [ -n "$container_ids" ]; then
+        local inspect_data
+        inspect_data=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{.Id}}' $container_ids 2>/dev/null || true)
 
-        # Get container details via Go Template (including IPAddress)
-        local details
-        details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range .NetworkSettings.Networks}}{{.NetworkID}} {{end}}|{{.NetworkSettings.Ports}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$cid" 2>/dev/null || true)
+        while IFS= read -r details; do
+            [ -z "$details" ] && continue
 
-        [ -z "$details" ] && continue
+            # Parse fields
+            local cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips long_id
+            IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips long_id <<< "$details"
 
-        # Parse fields
-        local cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips
-        IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks raw_ports ips <<< "$details"
-        cname="${cname#/}"
+            local is_npm=false
+            if [ -n "$npm_id" ]; then
+                if [ "$long_id" = "$npm_id" ] || [ "${long_id:0:12}" = "$npm_id" ] || [ "$cname" = "/$npm_id" ]; then
+                    is_npm=true
+                fi
+            fi
+            [ "$is_npm" = true ] && continue
+
+            cname="${cname#/}"
 
         # Strip "<no value>" strings from labels (for older docker engines/podman)
         enabled="${enabled#<no value>}"
@@ -908,7 +855,12 @@ configure_app_containers() {
         if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
             idle="${idle:-300}"
             start="${start:-30}"
-            ok "${BOLD}$cname${NC}${GREEN}  already configured  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
+            if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+                warn "${BOLD}$cname${NC}${YELLOW}  already configured  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
+                err "      restart: \"$restart\" must be changed to \"no\" manually in docker-compose.yml"
+            else
+                ok "${BOLD}$cname${NC}${GREEN}  already configured  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
+            fi
             continue
         fi
 
@@ -1204,7 +1156,8 @@ configure_app_containers() {
         echo ""
         info "Then run: docker compose up -d --force-recreate $cname"
 
-    done
+        done <<< "$inspect_data"
+    fi
 
     if [ "$any_unmanaged" = false ]; then
         ok "All containers are already configured."

@@ -3,171 +3,157 @@
 [![Master](https://img.shields.io/badge/branch-master-blue.svg)](https://github.com/msenturk/wake-on-request)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Wake-On-Request** automatically puts your Docker containers to sleep when idle and wakes them up instantly when someone visits your website. It runs directly inside Nginx Proxy Manager (NPM).
-
-## Recent Improvements
-- **Complex `docker-compose.yml` Support**: The installer now smartly handles multi-service compose files without corrupting them. It validates YAML parsing and gracefully falls back to manual insertion if needed.
-- **Improved Performance & Stability**: Upgraded background timers to use non-blocking recursive scheduling, preventing OpenResty timer pool exhaustion.
-- **Robust Error Handling**: Added explicit timeouts for Docker API calls and better logging for transient API errors during container spin-up.
-- **Bounded Memory Usage**: Added TTLs to shared dictionary keys to ensure memory scales predictably even on highly active reverse proxies.
-- **Splash Screen Reliability**: The splash screen now has a maximum retry cap (10 attempts) to prevent infinite loops if a container fails to start, displaying a clear error message instead.
+**Wake-On-Request** automatically puts your Docker/Podman containers to sleep when idle and wakes them up instantly when someone visits your website. It runs directly inside Nginx Proxy Manager (NPM)'s OpenResty process, requiring no sidecar containers.
 
 ---
 
-## Phase 1: Initial Setup 
+## Features & Current Status
 
-Run these steps in the folder where your Nginx Proxy Manager `docker-compose.yml` is located.
+* **Zero-UI Configuration (Method A - Recommended)**: Configure containers entirely via Docker labels. The installer will patch your `docker-compose.yml` automatically.
+* **NPM Advanced Tab Configuration (Method B)**: Configure containers in the NPM Web UI using simple Nginx variables (no complex Lua code blocks required).
+* **Global Interception**: Incoming requests are intercepted globally via a single injection block. No individual proxy host needs custom Lua access blocks.
+* **Cross-Network Support**: Fully supports containers running on different networks or using `network_mode: host` via TCP readiness probes targeted at host IPs and published ports.
+* **Automated SQLite Database Cleanup**: The installer automatically scans NPM's SQLite database to detect and clean up old, deprecated inline Lua access blocks.
+* **Interactive CLI Installer**: Scans the Docker daemon, matches container IPs/ports against NPM proxy hosts, prompts for the preferred configuration method, previews changes, and takes timestamped backups of all files before modifying them.
+* **Performance & Stability**: Timer scheduling is non-blocking to prevent OpenResty pool exhaustion, uses bounded TTL memory keys, and handles container startup failures gracefully with a retry-capped splash screen.
+
+---
+
+## Phase 1: Installation & Setup
+
+Run these steps in the directory where your Nginx Proxy Manager `docker-compose.yml` is located.
 
 ### 1. Run the Installer
-This script creates the necessary files and safely adds the required volume mounts to your `docker-compose.yml`.
+Run the script to download the engine files, scan your containers, and inject the global volume mounts into your NPM service definition:
 
-Run it in your NPM directory:
 ```bash
+# Run interactively (will prompt to configure discovered containers)
 curl -sSL https://raw.githubusercontent.com/msenturk/wake-on-request/master/install.sh | bash
 ```
 
-**Advanced Installation Options:**
-You can download the script and pass a target directory or use the `--dry-run` flag to verify what changes will be made without modifying any files.
+#### Advanced CLI Options:
+If you download the script locally, you can use the following flags:
 ```bash
-# Download the script first
+# Download the installer
 curl -O https://raw.githubusercontent.com/msenturk/wake-on-request/master/install.sh
 chmod +x install.sh
 
-# Install to a specific NPM directory
+# 1. Target a specific NPM directory
 ./install.sh /path/to/nginx-proxy-manager
 
-# Verify installation correctness (Safe, no changes made)
-./install.sh /path/to/nginx-proxy-manager --dry-run
+# 2. Preview proposed changes and container setup without writing files
+./install.sh --dry-run
+
+# 3. Manually specify the NPM container name or ID
+./install.sh --npm my-custom-npm-container
 ```
 
-### 2. Apply Changes
-Restart your NPM stack to enable the Wake-On-Request engine:
+### 2. Apply NPM Changes
+Restart your NPM stack to load the Wake-On-Request OpenResty plugin:
 ```bash
 docker compose up -d
 ```
 
 ---
 
-## Phase 2: Add your Apps (For every new app)
+## Phase 2: Container Configuration
 
-To manage an app with Wake-On-Request, you must configure both the app's Docker container and the NPM Proxy Host.
+To manage a container, ensure its restart policy is set to `restart: "no"` (so Wake-On-Request can keep it stopped when idle) and configure it using one of the two methods below.
 
-### Step 1: Prepare the App (Mandatory `docker-compose.yml` changes)
-Wake-On-Request cannot manage a container if Docker is constantly trying to restart it, or if NPM cannot reach it over the network. 
+### Method A: Docker Labels (Recommended - Zero UI Config)
+Add configuration parameters directly to your app's `docker-compose.yml` file. No changes are needed in Nginx Proxy Manager.
 
-Ensure your app's `docker-compose.yml` has **`restart: "no"`** and is in the **same network** as NPM.
 ```yaml
 services:
   my-app:
-    container_name: my-app  # <--- Remember this name
-    restart: "no"           # <--- Mandatory: Do not use 'always' or 'unless-stopped'
+    image: my-app:latest
+    container_name: my-app
+    restart: "no"  # <--- Required: Do not use 'always' or 'unless-stopped'
+    expose:
+      - "8080"
+    labels:
+      - "wakeonrequest.enable=true"
+      - "wakeonrequest.domain=app.example.com"             # Comma-separated for multiple domains
+      - "wakeonrequest.idle_timeout=300"                  # Optional: seconds of inactivity before stop (default: 300s)
+      - "wakeonrequest.start_timeout=30"                  # Optional: max seconds to wait on wake (default: 30s)
+      - "wakeonrequest.probe_host=192.168.1.103"          # Optional: Host IP if container is on a different network
+      - "wakeonrequest.port=8080"                         # Optional: Published port if on a different network
     networks:
-      - npm_proxy           # <--- Mandatory: Must match your NPM network
+      - npm_proxy
 ```
-*Note: If your container **cannot** be in the same network (e.g. using `network_mode: host`), see [Cross-Network Setup](#cross-network-setup-and-host-networking) below.*
-
-### Step 2: Configure in NPM UI
-1.  Open your **NPM Admin Dashboard**.
-2.  **Add a Proxy Host** (or edit an existing one).
-3.  Set **Forward Host** to your container name (e.g., `my-app`).
-4.  Go to the **Advanced Tab** and paste this snippet:
-
-```nginx
-access_by_lua_block {
-    require("wakeonrequest").wake("", { 
-        idle_timeout  = 600,  -- Stop after 10 mins of inactivity
-        splash        = true  -- Show the loading page
-    })
-}
-```
-5.  Click **Save**. That's it! Visit your domain and watch the container wake up.
+*Apply with:* `docker compose up -d --force-recreate my-app`
 
 ---
 
-## Options Reference
+### Method B: NPM Advanced Tab (Variable Override)
+If you prefer not to add labels to your container, you can configure it entirely inside Nginx Proxy Manager's Web UI. 
 
-| Option | Default | Description |
-| :--- | :--- | :--- |
-| `idle_timeout` | `300` | Seconds of inactivity before stopping the container. |
-| `start_timeout`| `30` | Max seconds to wait for the container to become healthy. |
-| `splash` | `true` | Show the white "Waking up..." loading page to users. |
-| `auto_port` | `true` | Automatically find the container's port (set to `false` for different networks). |
-| `use_ip` | `false` | Force routing via Direct IP instead of DNS (container name). |
-| `set_routing` | `true` | Overwrite Nginx routing variables. Set to `false` if using `network_mode: host`. |
+1. Edit your **Proxy Host** in the NPM Admin dashboard.
+2. Go to the **Advanced Tab** and paste the Nginx variable definitions:
+
+```nginx
+set $wake_container      "my-container-name";   # Required
+set $wake_idle_timeout   300;                  # Optional (default: 300s)
+set $wake_start_timeout  30;                   # Optional (default: 30s)
+set $wake_probe_host     "192.168.1.103";      # Optional: Host IP (for cross-network setups)
+set $wake_port           8080;                 # Optional: Published port (for cross-network setups)
+set $wake_splash         "true";               # Optional: Show loading page (default: true)
+```
+3. Save the Proxy Host.
+
+---
+
+## Configuration Reference
+
+| Option | Nginx Variable | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `wakeonrequest.enable` | - | - | Set to `true` to opt-in the container for management. |
+| `wakeonrequest.domain` | - | - | Comma-separated domains mapped to this container. |
+| `wakeonrequest.idle_timeout` | `$wake_idle_timeout` | `300` | Inactivity duration in seconds before stopping the container. |
+| `wakeonrequest.start_timeout` | `$wake_start_timeout` | `30` | Maximum seconds to wait for readiness probes on startup. |
+| `wakeonrequest.probe_host` | `$wake_probe_host` | *Container name* | Target hostname/IP for TCP connectivity readiness check. |
+| `wakeonrequest.port` | `$wake_port` | *Exposed port* | Port number for the TCP connectivity readiness check. |
+| - | `$wake_splash` | `"true"` | Set to `"false"` to disable showing the waking-up splash screen. |
+| - | `$wake_timer_interval` | `60` | Background loop check frequency for idle containers. |
+| - | `$wake_poll_interval` | `0.5` | Readiness probe retry interval during container startup. |
 
 ---
 
 ## Troubleshooting
 
-**1. Check the Logs**
-If an app isn't waking up or you see a 502/500 error, watch the logs in real-time:
+### 1. View Engine Logs
+Watch logs in real-time to debug wake-up and sleep lifecycles:
 ```bash
 # General Docker logs
 docker logs -f nginx-proxy-manager 2>&1 | grep wakeonrequest
 
-# Detailed Nginx error logs (NPM specific)
+# Detailed Nginx error logs (contains OpenResty lua errors)
 docker exec -it nginx-proxy-manager tail -f /data/logs/fallback_error.log
-
-# Podman users
-podman exec -it nginx-proxy-manager tail -f /data/logs/fallback_error.log
 ```
 
-**2. Permission Denied**
-NPM needs access to the Docker socket. If you see permission errors in the logs, run:
+### 2. Docker Socket Permission Error
+If you see permission denied warnings or docker connection failures in your logs:
 ```bash
 sudo chmod 666 /var/run/docker.sock
 ```
 
-**3. DNS / Networking**
-By default, Wake-On-Request uses the **container name (DNS)** to reach your apps, which is the best practice for Docker/Podman networking. 
-
-If DNS resolution is unstable or has high latency in your environment, Wake-On-Request will automatically fallback to the **Direct IP** of the container to ensure the request succeeds. You can force Direct IP usage by setting `use_ip = true` in the configuration.
-
-**4. Managing Log Size**
-NPM logs can grow over time. You can clear them manually or set up automatic rotation.
-
-*Manual clear:*
-```bash
-docker exec nginx-proxy-manager sh -c "truncate -s 0 /data/logs/fallback_error.log"
-```
-
-*Automatic (Add to docker-compose.yml):*
-```yaml
-services:
-  npm:
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-```
-
----
-
-## Advanced Scenarios
-
-### Method B: Using Docker Labels
-If you prefer keeping configuration in your YAML instead of the UI, add these labels to your container:
-- `wakeonrequest.enable: "true"`
-- `wakeonrequest.idle_timeout: "300"`
-
-Then, in the NPM UI Advanced tab, just use: `access_by_lua_block { require("wakeonrequest").wake("container_name") }`
-
-### Cross-Network Setup (and Host Networking)
-If your containers are on a **different network** than NPM or are using **`network_mode: host`**, you must configure NPM to route by IP instead of DNS:
-1.  Set **Forward Host** to your Host IP (e.g., `172.17.0.1` or `10.x.x.x`). Do NOT use the container name here.
-2.  In the Lua snippet, provide the container name explicitly and disable automatic routing:
-```nginx
-access_by_lua_block {
-    require("wakeonrequest").wake("real-container-name", { 
-        auto_port   = false,
-        set_routing = false 
-    })
-}
-```
+### 3. Log Management
+Custom logs are stored in standard locations. To prevent log exhaustion:
+* **Manual clear**:
+  ```bash
+  docker exec nginx-proxy-manager sh -c "truncate -s 0 /data/logs/fallback_error.log"
+  ```
+* **Auto rotation** (add to NPM service's `docker-compose.yml` logging block):
+  ```yaml
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+  ```
 
 ---
 
 ## License
-MIT License. Free for personal and commercial use. See [LICENSE](LICENSE) for details.
-[LICENSE](LICENSE) for details.
+
+MIT License. See [LICENSE](LICENSE) for details.
