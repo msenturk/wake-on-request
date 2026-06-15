@@ -140,6 +140,7 @@ EOF
 
     echo -e "${GREEN}✅ PASSED: Backups created correctly.${NC}"
     cleanup_test_env
+}
 
 # --- Run All Tests ---
 echo -e "${BLUE}🏁 Starting Test Suite...${NC}"

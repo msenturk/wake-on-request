@@ -64,72 +64,154 @@ backup_file() {
     info "Backed up $file → $bak"
 }
 
-docker_api() { curl -sf --unix-socket /var/run/docker.sock "http://localhost$1"; }
-has_docker() { [ -e "/var/run/docker.sock" ]; }
-has_jq()     { command -v jq >/dev/null 2>&1; }
+DOCKER_CMD=""
+detect_docker_cli() {
+    if [ -n "$DOCKER_CMD" ]; then
+        return 0
+    fi
+    if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
+        DOCKER_CMD="docker"
+        return 0
+    fi
+    if command -v podman >/dev/null 2>&1 && podman ps >/dev/null 2>&1; then
+        DOCKER_CMD="podman"
+        return 0
+    fi
+    return 1
+}
+has_docker() {
+    detect_docker_cli
+}
+
+NPM_PROXY_HOSTS=""
+fetch_npm_proxy_hosts() {
+    if ! has_docker; then
+        return
+    fi
+    local npm_cid
+    npm_cid=$($DOCKER_CMD compose ps -q app 2>/dev/null || true)
+    [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD compose ps -q nginx-proxy-manager 2>/dev/null || true)
+    [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "name=nginx-proxy-manager" 2>/dev/null | head -n1)
+    [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "ancestor=jc21/nginx-proxy-manager" 2>/dev/null | head -n1)
+    if [ -n "$npm_cid" ]; then
+        NPM_PROXY_HOSTS=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
+            "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null || echo "")
+    fi
+}
+
+find_npm_config_for_container() {
+    local cname="$1"
+    local ips="$2"
+    matched_domain=""
+    matched_port=""
+
+    [ -z "$NPM_PROXY_HOSTS" ] && return 1
+
+    while IFS='|' read -r domain_json fwd_host fwd_port; do
+        [ -z "$domain_json" ] && continue
+
+        local is_match=false
+        if [ "$fwd_host" = "$cname" ]; then
+            is_match=true
+        else
+            for ip in $ips; do
+                if [ "$fwd_host" = "$ip" ]; then
+                    is_match=true
+                    break
+                fi
+            done
+        fi
+
+        if [ "$is_match" = true ]; then
+            local domains
+            domains=$(echo "$domain_json" | tr -d '[]"' | tr ',' ' ' | xargs)
+            matched_domain=$(echo "$domains" | awk '{print $1}')
+            matched_port="$fwd_port"
+            return 0
+        fi
+    done <<< "$NPM_PROXY_HOSTS"
+    return 1
+}
 
 # ── Docker Environment Scan ────────────────────────────────────────────────────
 scan_docker_environment() {
     section "Environment Scan"
 
     if ! has_docker; then
-        warn "Docker socket not accessible — skipping environment scan."
-        return
-    fi
-    if ! has_jq; then
-        warn "'jq' not installed — skipping environment scan."
+        warn "Docker socket or daemon not accessible — skipping environment scan."
         return
     fi
 
-    local cjson
-    cjson=$(docker_api "/containers/json?all=1")
+    fetch_npm_proxy_hosts
 
-    local npm_id
-    npm_id=$(echo "$cjson" | jq -r '
-        .[] | select(.Image | test("nginx-proxy-manager")) | .Id' | head -n1)
+    local container_ids npm_id npm_networks
+    container_ids=$($DOCKER_CMD ps -a -q || true)
 
-    local npm_networks
-    npm_networks=$(echo "$cjson" | jq -r --arg id "$npm_id" '
-        .[] | select(.Id == $id) | .NetworkSettings.Networks | keys[]' 2>/dev/null || true)
+    # Find NPM container
+    npm_id=""
+    for cid in $container_ids; do
+        local img
+        img=$($DOCKER_CMD inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)
+        if echo "$img" | grep -q "nginx-proxy-manager"; then
+            npm_id="$cid"
+            break
+        fi
+    done
 
-    # Build a jq filter to check NPM network membership
-    local jq_net_filter="false"
-    if [ -n "$npm_networks" ]; then
-        jq_net_filter=$(echo "$npm_networks" \
-            | awk '{print "has(\""$1"\")"}' | paste -sd ' or ' -)
+    if [ -n "$npm_id" ]; then
+        npm_networks=$($DOCKER_CMD inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$npm_id" 2>/dev/null || true)
     fi
 
-    # Containers with 'always' or 'unless-stopped' restart policies
-    local restart_warning
-    restart_warning=$(echo "$cjson" | jq -r --arg id "$npm_id" '
-        .[] | select(.Id != $id)
-             | select(.HostConfig.RestartPolicy.Name == "always"
-                   or .HostConfig.RestartPolicy.Name == "unless-stopped")
-             | "    \(.Names[0] | ltrimstr("/"))  [restart: \(.HostConfig.RestartPolicy.Name)]"')
+    local restart_warning=""
+    local isolated=""
+
+    for cid in $container_ids; do
+        [ "$cid" = "$npm_id" ] && continue
+
+        # Inspect container
+        local details
+        details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid" 2>/dev/null || true)
+        [ -z "$details" ] && continue
+
+        # Parse fields
+        local cname restart network networks
+        IFS='|' read -r cname restart network networks <<< "$details"
+        cname="${cname#/}"
+
+        # 1. Check restart policy
+        if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+            restart_warning="${restart_warning}    ${cname}  [restart: ${restart}]\n"
+        fi
+
+        # 2. Check network membership
+        # Skip host network containers
+        if [ "$network" != "host" ]; then
+            local shares_network=false
+            for net in $npm_networks; do
+                for cnet in $networks; do
+                    if [ "$net" = "$cnet" ]; then
+                        shares_network=true
+                        break 2
+                    fi
+                done
+            done
+
+            if [ "$shares_network" = false ]; then
+                isolated="${isolated}    ${cname}\n"
+            fi
+        fi
+    done
 
     if [ -n "$restart_warning" ]; then
         warn "These containers have auto-restart enabled, which PREVENTS Wake-On-Request"
         warn "from stopping them. Change restart to \"no\" in their docker-compose.yml:"
-        echo "$restart_warning" | while IFS= read -r line; do
-            echo -e "  ${YELLOW}${line}${NC}"
-        done
+        echo -e "$restart_warning"
     fi
-
-    # Containers on a different network than NPM
-    local isolated
-    isolated=$(echo "$cjson" | jq -r --arg id "$npm_id" \
-        --argjson net_filter "$(echo "$jq_net_filter" | jq -Rs .)" '
-        .[] | select(.Id != $id)
-             | select(.HostConfig.NetworkMode != "host")
-             | select(.Image | test("nginx-proxy-manager") | not)
-             | select(.NetworkSettings.Networks | ($net_filter | @json | fromjson | . == "false")
-                or (.NetworkSettings.Networks | to_entries | length == 0))
-             | "    \(.Names[0] | ltrimstr("/"))"' 2>/dev/null || true)
 
     if [ -n "$isolated" ]; then
         warn "These containers are on a DIFFERENT network than NPM."
         info "For these, set NPM Forward Host to your Docker Host IP."
-        echo "$isolated"
+        echo -e "$isolated"
     fi
 
     ok "Environment scan complete."
@@ -210,30 +292,54 @@ run_dry_run() {
 
     # ── Container label status ────────────────────────────────────────────────
     section "Container Label Status"
-    if has_docker && has_jq; then
-        local cjson npm_id npm_networks
-        cjson=$(docker_api "/containers/json?all=1")
-        npm_id=$(echo "$cjson" | jq -r '
-            .[] | select(.Image | test("nginx-proxy-manager")) | .Id' | head -n1)
-        npm_networks=$(echo "$cjson" | jq -r --arg id "$npm_id" '
-            .[] | select(.Id == $id) | .NetworkSettings.Networks | keys[]' 2>/dev/null || true)
+    if has_docker; then
+        fetch_npm_proxy_hosts
+        local container_ids npm_id npm_networks
+        container_ids=$($DOCKER_CMD ps -a -q || true)
+        
+        # Find NPM container
+        npm_id=""
+        for cid in $container_ids; do
+            local img
+            img=$($DOCKER_CMD inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)
+            if echo "$img" | grep -q "nginx-proxy-manager"; then
+                npm_id="$cid"
+                break
+            fi
+        done
 
-        echo "$cjson" | jq -c --arg id "$npm_id" '.[] | select(.Id != $id)' | \
-        while IFS= read -r c; do
-            local cname state restart network enabled domain
-            cname=$(echo "$c"   | jq -r '.Names[0] | ltrimstr("/")')
-            state=$(echo "$c"   | jq -r '.State')
-            restart=$(echo "$c" | jq -r '.HostConfig.RestartPolicy.Name')
-            network=$(echo "$c" | jq -r '.HostConfig.NetworkMode')
-            enabled=$(echo "$c" | jq -r '.Labels["wakeonrequest.enable"] // ""')
-            domain=$(echo "$c"  | jq -r '.Labels["wakeonrequest.domain"] // ""')
+        if [ -n "$npm_id" ]; then
+            npm_networks=$($DOCKER_CMD inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$npm_id" 2>/dev/null || true)
+        fi
+
+        for cid in $container_ids; do
+            [ "$cid" = "$npm_id" ] && continue
+
+            # Get container details via Go Template (including IPAddress)
+            local details
+            details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}|{{if .Config.ExposedPorts}}{{range $k, $v := .Config.ExposedPorts}}{{$k}} {{end}}{{end}}|{{if .NetworkSettings.Ports}}{{range $k, $v := .NetworkSettings.Ports}}{{range $v}}{{.HostPort}} {{end}}{{end}}{{end}}|{{range $k, $v := .NetworkSettings.Networks}}{{$v.IPAddress}} {{end}}' "$cid" 2>/dev/null || true)
+
+            [ -z "$details" ] && continue
+
+            # Parse fields
+            local cname state restart network enabled domain idle start port_label compose_file svc_name networks exposed_ports published_ports ips
+            IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks exposed_ports published_ports ips <<< "$details"
+            cname="${cname#/}"
+
+            # Strip "<no value>" strings from labels (for older docker engines/podman)
+            enabled="${enabled#<no value>}"
+            domain="${domain#<no value>}"
+            idle="${idle#<no value>}"
+            start="${start#<no value>}"
+            port_label="${port_label#<no value>}"
+            compose_file="${compose_file#<no value>}"
+            svc_name="${svc_name#<no value>}"
 
             echo ""
             # ── Already configured ────────────────────────────────────────────
             if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
-                local idle start
-                idle=$(echo "$c" | jq -r '.Labels["wakeonrequest.idle_timeout"] // "300"')
-                start=$(echo "$c" | jq -r '.Labels["wakeonrequest.start_timeout"] // "30"')
+                idle="${idle:-300}"
+                start="${start:-30}"
                 ok "${BOLD}$cname${NC}${GREEN}  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
                 continue
             fi
@@ -246,37 +352,65 @@ run_dry_run() {
             # ── Not yet configured — detect everything ────────────────────────
 
             # Detect exposed port (prefer label > single exposed port > published port)
-            local port_label exposed_port published_port detected_port port_source
-            port_label=$(echo "$c"     | jq -r '.Labels["wakeonrequest.port"] // ""')
-            exposed_port=$(echo "$c"   | jq -r '
-                (.Config.ExposedPorts // {}) | keys
-                | map(scan("^[0-9]+")) | if length == 1 then .[0] else "" end')
-            published_port=$(echo "$c" | jq -r '
-                [.Ports[]? | select(.PublicPort != null) | .PublicPort | tostring]
-                | if length == 1 then .[0] else "" end')
+            local detected_port="" port_source=""
+            
+            # Clean exposed/published ports & ips
+            exposed_ports=$(echo "$exposed_ports" | xargs)
+            published_ports=$(echo "$published_ports" | xargs)
+            ips=$(echo "$ips" | xargs)
 
-            if   [ -n "$port_label" ];     then detected_port="$port_label";    port_source="from label"
-            elif [ -n "$exposed_port" ];   then detected_port="$exposed_port";  port_source="auto-detected"
-            elif [ -n "$published_port" ]; then detected_port="$published_port"; port_source="published port"
-            else                                detected_port="";               port_source=""
+            # Count exposed/published ports
+            local exp_count pub_count
+            exp_count=$(echo "$exposed_ports" | wc -w)
+            pub_count=$(echo "$published_ports" | wc -w)
+
+            local single_exposed=""
+            if [ "$exp_count" -eq 1 ]; then
+                single_exposed="${exposed_ports%%/*}"
+            fi
+
+            local single_published=""
+            if [ "$pub_count" -eq 1 ]; then
+                single_published="${published_ports}"
+            fi
+
+            # Match against NPM SQLite database
+            local matched_domain="" matched_port=""
+            find_npm_config_for_container "$cname" "$ips"
+
+            if [ -n "$port_label" ]; then
+                detected_port="$port_label"
+                port_source="from label"
+            elif [ -n "$matched_port" ]; then
+                detected_port="$matched_port"
+                port_source="from NPM database"
+            elif [ -n "$single_exposed" ]; then
+                detected_port="$single_exposed"
+                port_source="auto-detected"
+            elif [ -n "$single_published" ]; then
+                detected_port="$single_published"
+                port_source="published port"
+            else
+                detected_port=""
+                port_source=""
             fi
 
             # Determine if this container shares a network with NPM
             local shares_network=false
-            if [ -n "$npm_networks" ]; then
-                while IFS= read -r net; do
-                    if echo "$c" | jq -e --arg n "$net" \
-                        '.NetworkSettings.Networks | has($n)' >/dev/null 2>&1; then
-                        shares_network=true; break
+            for net in $npm_networks; do
+                for cnet in $networks; do
+                    if [ "$net" = "$cnet" ]; then
+                        shares_network=true
+                        break 2
                     fi
-                done <<< "$npm_networks"
-            fi
+                done
+            done
 
             # Decide Forward Host recommendation
             local fwd_host fwd_port fwd_note restart_needed
             if [ "$network" = "host" ]; then
                 fwd_host="<your-docker-host-ip>"
-                fwd_port="${published_port:-<port>}"
+                fwd_port="${single_published:-<port>}"
                 fwd_note="host network — NPM cannot route by name"
             elif [ "$shares_network" = "true" ]; then
                 fwd_host="$cname"
@@ -284,13 +418,22 @@ run_dry_run() {
                 fwd_note="same network as NPM — use container name"
             else
                 fwd_host="<your-docker-host-ip>"
-                fwd_port="${published_port:-<port>}"
+                fwd_port="${single_published:-<port>}"
                 fwd_note="different network from NPM — use host IP"
             fi
 
             restart_needed=false
             if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
                 restart_needed=true
+            fi
+
+            # ── Translate Windows path to WSL format ──────────────────────────────
+            local compose_path="$compose_file"
+            if [ -n "$compose_path" ]; then
+                compose_path="${compose_path//\\//}"
+                if [[ "$compose_path" =~ ^[a-zA-Z]:/ ]]; then
+                    compose_path=$(wslpath -u "$compose_path" 2>/dev/null || echo "$compose_path")
+                fi
             fi
 
             # ── Print tailored block ──────────────────────────────────────────
@@ -314,20 +457,74 @@ run_dry_run() {
             echo -e "     Note         : ${BLUE}$fwd_note${NC}"
 
             echo ""
-            echo -e "     ${BOLD}── Add to $cname's docker-compose.yml ──${NC}"
-            echo ""
-            if [ "$restart_needed" = "true" ]; then
-                echo -e "     ${YELLOW}restart: \"no\"${NC}                                  ${BLUE}# change from: $restart${NC}"
+            local label_domain="<your-domain.example.com>"
+            [ -n "$matched_domain" ] && label_domain="$matched_domain"
+
+            if [ -n "$compose_path" ] && [ -f "$compose_path" ]; then
+                if grep -qF "wakeonrequest.enable" "$compose_path"; then
+                    ok "Compose File : ${GREEN}Already configured${NC} in ${BLUE}$compose_path${NC}"
+                else
+                    change "Compose File : ${YELLOW}Will patch${NC} at ${BLUE}$compose_path${NC}"
+                    echo ""
+                    echo -e "     ${BOLD}── Proposed changes for $compose_path ──${NC}"
+                    echo ""
+                    if [ "$restart_needed" = "true" ]; then
+                        echo -e "     ${YELLOW}restart: \"no\"${NC}                                  ${BLUE}# change from: $restart${NC}"
+                    fi
+                    echo -e "     ${GREEN}labels:${NC}"
+                    echo -e "     ${GREEN}  - \"wakeonrequest.enable=true\"${NC}"
+                    echo -e "     ${GREEN}  - \"wakeonrequest.domain=${label_domain}\"${NC}  ${BLUE}# ← your NPM domain${NC}"
+                    echo -e "     ${GREEN}  - \"wakeonrequest.idle_timeout=300\"${NC}                  ${BLUE}# stop after 5 min idle${NC}"
+                    echo -e "     ${GREEN}  - \"wakeonrequest.start_timeout=30\"${NC}                  ${BLUE}# wait up to 30s on wake${NC}"
+                    echo ""
+                fi
+            else
+                warn "Compose File : ${RED}Not found${NC} (checked: ${YELLOW}${compose_path:-none}${NC})"
+                echo ""
+                echo -e "     ${BOLD}── Add to $cname's docker-compose.yml manually ──${NC}"
+                echo ""
+                if [ "$restart_needed" = "true" ]; then
+                    echo -e "     ${YELLOW}restart: \"no\"${NC}                                  ${BLUE}# change from: $restart${NC}"
+                fi
+                echo -e "     ${GREEN}labels:${NC}"
+                echo -e "     ${GREEN}  - \"wakeonrequest.enable=true\"${NC}"
+                echo -e "     ${GREEN}  - \"wakeonrequest.domain=${label_domain}\"${NC}  ${BLUE}# ← your NPM domain${NC}"
+                echo -e "     ${GREEN}  - \"wakeonrequest.idle_timeout=300\"${NC}                  ${BLUE}# stop after 5 min idle${NC}"
+                echo -e "     ${GREEN}  - \"wakeonrequest.start_timeout=30\"${NC}                  ${BLUE}# wait up to 30s on wake${NC}"
+                echo ""
             fi
-            echo -e "     ${GREEN}labels:${NC}"
-            echo -e "     ${GREEN}  - \"wakeonrequest.enable=true\"${NC}"
-            echo -e "     ${GREEN}  - \"wakeonrequest.domain=<your-domain.example.com>\"${NC}  ${BLUE}# ← your NPM domain${NC}"
-            echo -e "     ${GREEN}  - \"wakeonrequest.idle_timeout=300\"${NC}                  ${BLUE}# stop after 5 min idle${NC}"
-            echo -e "     ${GREEN}  - \"wakeonrequest.start_timeout=30\"${NC}                  ${BLUE}# wait up to 30s on wake${NC}"
-            echo ""
         done
     else
-        warn "Docker socket or jq not available — skipping container scan."
+        warn "Docker socket or daemon not available — skipping container scan."
+    fi
+
+    # ── NPM Database Status ───────────────────────────────────────────────────
+    section "NPM Database Status"
+    local npm_db="./data/database.sqlite"
+    if [ -f "$npm_db" ]; then
+        if has_docker; then
+            local npm_cid
+            npm_cid=$($DOCKER_CMD compose ps -q app 2>/dev/null || true)
+            [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD compose ps -q nginx-proxy-manager 2>/dev/null || true)
+            [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "name=nginx-proxy-manager" 2>/dev/null | head -n1)
+            [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "ancestor=jc21/nginx-proxy-manager" 2>/dev/null | head -n1)
+            if [ -n "$npm_cid" ]; then
+                local count
+                count=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
+                    "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null || echo "")
+                if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
+                    change "NPM Database: Will clear old Lua snippets from $count proxy host(s) in Advanced tab."
+                else
+                    ok "NPM Database: No old Lua snippets to clean."
+                fi
+            else
+                warn "NPM container is not running — skipping database check."
+            fi
+        else
+            warn "Docker socket not accessible — skipping database check."
+        fi
+    else
+        info "No NPM database found at $npm_db — skipping database check."
     fi
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -354,75 +551,133 @@ run_dry_run() {
 # to patch it, prompt for the domain, then write only the wakeonrequest labels.
 # Never touches restart policy — just warns if it needs changing.
 configure_app_containers() {
-    if ! has_docker || ! has_jq; then
-        warn "Docker socket or jq not available — skipping app container setup."
+    if ! has_docker; then
+        warn "Docker socket or daemon not available — skipping app container setup."
         return
     fi
 
     section "App Container Setup"
 
-    local cjson npm_id npm_networks
-    cjson=$(docker_api "/containers/json?all=1")
-    npm_id=$(echo "$cjson" | jq -r '
-        .[] | select(.Image | test("nginx-proxy-manager")) | .Id' | head -n1)
-    npm_networks=$(echo "$cjson" | jq -r --arg id "$npm_id" '
-        .[] | select(.Id == $id) | .NetworkSettings.Networks | keys[]' 2>/dev/null || true)
+    fetch_npm_proxy_hosts
+
+    local container_ids npm_id npm_networks
+    container_ids=$($DOCKER_CMD ps -a -q || true)
+
+    # Find NPM container
+    npm_id=""
+    for cid in $container_ids; do
+        local img
+        img=$($DOCKER_CMD inspect --format '{{.Config.Image}}' "$cid" 2>/dev/null || true)
+        if echo "$img" | grep -q "nginx-proxy-manager"; then
+            npm_id="$cid"
+            break
+        fi
+    done
+
+    if [ -n "$npm_id" ]; then
+        npm_networks=$($DOCKER_CMD inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$npm_id" 2>/dev/null || true)
+    fi
 
     local any_unmanaged=false
 
-    while IFS= read -r c; do
-        local cname enabled domain compose_file
-        cname=$(echo "$c"   | jq -r '.Names[0] | ltrimstr("/")')
-        enabled=$(echo "$c" | jq -r '.Labels["wakeonrequest.enable"] // ""')
-        domain=$(echo "$c"  | jq -r '.Labels["wakeonrequest.domain"] // ""')
+    for cid in $container_ids; do
+        [ "$cid" = "$npm_id" ] && continue
+
+        # Get container details via Go Template (including IPAddress)
+        local details
+        details=$($DOCKER_CMD inspect --format '{{.Name}}|{{.State.Status}}|{{.HostConfig.RestartPolicy.Name}}|{{.HostConfig.NetworkMode}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.enable"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.domain"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.idle_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.start_timeout"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "wakeonrequest.port"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.project.config_files"}}{{end}}|{{if .Config.Labels}}{{index .Config.Labels "com.docker.compose.service"}}{{end}}|{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}|{{if .Config.ExposedPorts}}{{range $k, $v := .Config.ExposedPorts}}{{$k}} {{end}}{{end}}|{{if .NetworkSettings.Ports}}{{range $k, $v := .NetworkSettings.Ports}}{{range $v}}{{.HostPort}} {{end}}{{end}}{{end}}|{{range $k, $v := .NetworkSettings.Networks}}{{$v.IPAddress}} {{end}}' "$cid" 2>/dev/null || true)
+
+        [ -z "$details" ] && continue
+
+        # Parse fields
+        local cname state restart network enabled domain idle start port_label compose_file svc_name networks exposed_ports published_ports ips
+        IFS='|' read -r cname state restart network enabled domain idle start port_label compose_file svc_name networks exposed_ports published_ports ips <<< "$details"
+        cname="${cname#/}"
+
+        # Strip "<no value>" strings from labels (for older docker engines/podman)
+        enabled="${enabled#<no value>}"
+        domain="${domain#<no value>}"
+        idle="${idle#<no value>}"
+        start="${start#<no value>}"
+        port_label="${port_label#<no value>}"
+        compose_file="${compose_file#<no value>}"
+        svc_name="${svc_name#<no value>}"
 
         # Skip already-configured containers
         if [ "$enabled" = "true" ] && [ -n "$domain" ]; then
-            local idle start
-            idle=$(echo "$c" | jq -r '.Labels["wakeonrequest.idle_timeout"] // "300"')
-            start=$(echo "$c" | jq -r '.Labels["wakeonrequest.start_timeout"] // "30"')
+            idle="${idle:-300}"
+            start="${start:-30}"
             ok "${BOLD}$cname${NC}${GREEN}  already configured  →  domain: $domain  |  idle: ${idle}s  |  start: ${start}s"
             continue
         fi
 
         any_unmanaged=true
 
-        # ── Detect compose file via Docker Compose labels ─────────────────────
-        compose_file=$(echo "$c" | jq -r \
-            '.Labels["com.docker.compose.project.config_files"] // ""' | cut -d',' -f1)
+        # Detect exposed port (prefer label > single exposed port > published port)
+        local detected_port="" port_source=""
+        
+        # Clean exposed/published ports & ips
+        exposed_ports=$(echo "$exposed_ports" | xargs)
+        published_ports=$(echo "$published_ports" | xargs)
+        ips=$(echo "$ips" | xargs)
 
-        # ── Detect restart policy ─────────────────────────────────────────────
-        local restart
-        restart=$(echo "$c" | jq -r '.HostConfig.RestartPolicy.Name')
+        # Count exposed/published ports
+        local exp_count pub_count
+        exp_count=$(echo "$exposed_ports" | wc -w)
+        pub_count=$(echo "$published_ports" | wc -w)
 
-        # ── Detect network / forward host ─────────────────────────────────────
-        local network shares_network fwd_host detected_port port_source
-        network=$(echo "$c" | jq -r '.HostConfig.NetworkMode')
-        shares_network=false
-        if [ -n "$npm_networks" ]; then
-            while IFS= read -r net; do
-                if echo "$c" | jq -e --arg n "$net" \
-                    '.NetworkSettings.Networks | has($n)' >/dev/null 2>&1; then
-                    shares_network=true; break
+        local single_exposed=""
+        if [ "$exp_count" -eq 1 ]; then
+            single_exposed="${exposed_ports%%/*}"
+        fi
+
+        local single_published=""
+        if [ "$pub_count" -eq 1 ]; then
+            single_published="${published_ports}"
+        fi
+
+        local user_domain=""
+        local default_domain=""
+        local default_port=""
+        
+        # 1. Search in NPM SQLite database
+        local matched_domain="" matched_port=""
+        find_npm_config_for_container "$cname" "$ips"
+        
+        if [ -n "$matched_domain" ]; then
+            default_domain="$matched_domain"
+            default_port="$matched_port"
+            port_source="from NPM database"
+        else
+            # Fallback to standard exposed/published port detection
+            if [ -n "$port_label" ]; then
+                default_port="$port_label"
+                port_source="from label"
+            elif [ -n "$single_exposed" ]; then
+                default_port="$single_exposed"
+                port_source="auto-detected"
+            elif [ -n "$single_published" ]; then
+                default_port="$single_published"
+                port_source="published port"
+            else
+                default_port=""
+                port_source=""
+            fi
+        fi
+
+        # Determine if this container shares a network with NPM
+        local shares_network=false
+        for net in $npm_networks; do
+            for cnet in $networks; do
+                if [ "$net" = "$cnet" ]; then
+                    shares_network=true
+                    break 2
                 fi
-            done <<< "$npm_networks"
-        fi
+            done
+        done
 
-        local port_label exposed_port published_port
-        port_label=$(echo "$c"     | jq -r '.Labels["wakeonrequest.port"] // ""')
-        exposed_port=$(echo "$c"   | jq -r '
-            (.Config.ExposedPorts // {}) | keys
-            | map(scan("^[0-9]+")) | if length == 1 then .[0] else "" end')
-        published_port=$(echo "$c" | jq -r '
-            [.Ports[]? | select(.PublicPort != null) | .PublicPort | tostring]
-            | if length == 1 then .[0] else "" end')
-
-        if   [ -n "$port_label" ];     then detected_port="$port_label";     port_source="from label"
-        elif [ -n "$exposed_port" ];   then detected_port="$exposed_port";   port_source="auto-detected"
-        elif [ -n "$published_port" ]; then detected_port="$published_port"; port_source="published port"
-        else                                detected_port="";                port_source=""
-        fi
-
+        # Decide Forward Host recommendation
+        local fwd_host
         if [ "$network" = "host" ]; then
             fwd_host="<your-docker-host-ip>"
         elif [ "$shares_network" = "true" ]; then
@@ -433,10 +688,13 @@ configure_app_containers() {
 
         # ── Print container summary ───────────────────────────────────────────
         echo ""
-        echo -e "  ${YELLOW}➕ ${BOLD}$cname${NC}  [state: $(echo "$c" | jq -r '.State') | restart: $restart]"
+        echo -e "  ${YELLOW}➕ ${BOLD}$cname${NC}  [state: $state | restart: $restart]"
+        if [ -n "$default_domain" ]; then
+            echo -e "     NPM Domain       : ${GREEN}$default_domain${NC}  ${BLUE}(auto-detected from database)${NC}"
+        fi
         echo -e "     NPM Forward Host : ${GREEN}$fwd_host${NC}"
-        if [ -n "$detected_port" ]; then
-            echo -e "     NPM Forward Port : ${GREEN}$detected_port${NC}  ${BLUE}($port_source)${NC}"
+        if [ -n "$default_port" ] && [ "$default_port" != "<port>" ]; then
+            echo -e "     NPM Forward Port : ${GREEN}$default_port${NC}  ${BLUE}($port_source)${NC}"
         else
             echo -e "     NPM Forward Port : ${YELLOW}<set manually>${NC}"
         fi
@@ -447,21 +705,31 @@ configure_app_containers() {
 
         # ── Ask whether to configure this container ───────────────────────────
         echo ""
-        printf "     Configure wake-on-request for %s? [y/N] " "$cname"
+        local prompt_msg="Configure wake-on-request for $cname"
+        if [ -n "$default_domain" ]; then
+            prompt_msg="$prompt_msg (domain: $default_domain, port: $default_port)"
+        fi
+        printf "     %s? [Y/n] " "$prompt_msg"
         local answer
         read -r answer </dev/tty
+        if [ -z "$answer" ]; then
+            answer="y"
+        fi
         if [[ ! "$answer" =~ ^[Yy]$ ]]; then
             info "Skipped $cname"
             continue
         fi
 
-        # ── Prompt for domain ─────────────────────────────────────────────────
-        local user_domain=""
-        while [ -z "$user_domain" ]; do
-            printf "     NPM domain for %s (e.g. app.example.com): " "$cname"
-            read -r user_domain </dev/tty
-            user_domain="${user_domain// /}"   # strip accidental spaces
-        done
+        # ── Resolve domain ────────────────────────────────────────────────────
+        if [ -n "$default_domain" ]; then
+            user_domain="$default_domain"
+        else
+            while [ -z "$user_domain" ]; do
+                printf "     NPM domain for %s (e.g. app.example.com): " "$cname"
+                read -r user_domain </dev/tty
+                user_domain="${user_domain// /}"   # strip accidental spaces
+            done
+        fi
 
         # ── Prompt for idle timeout ───────────────────────────────────────────
         local user_idle=""
@@ -477,20 +745,25 @@ configure_app_containers() {
         user_start="${user_start// /}"
         [ -z "$user_start" ] && user_start="30"
 
-        # ── Locate and patch the compose file ────────────────────────────────
-        if [ -n "$compose_file" ] && [ -f "$compose_file" ]; then
-            echo ""
-            info "Found compose file: $compose_file"
+        # ── Translate Windows path to WSL format ──────────────────────────────
+        local compose_path="$compose_file"
+        if [ -n "$compose_path" ]; then
+            compose_path="${compose_path//\\//}"
+            if [[ "$compose_path" =~ ^[a-zA-Z]:/ ]]; then
+                compose_path=$(wslpath -u "$compose_path" 2>/dev/null || echo "$compose_path")
+            fi
+        fi
 
-            # Check if labels block already exists under this service
-            local svc_name
-            svc_name=$(echo "$c" | jq -r '.Labels["com.docker.compose.service"] // ""')
+        # ── Locate and patch the compose file ────────────────────────────────
+        if [ -n "$compose_path" ] && [ -f "$compose_path" ]; then
+            echo ""
+            info "Found compose file: $compose_path"
 
             # Safety check: only patch if we can find the service name in the file
-            if [ -z "$svc_name" ] || ! grep -qF "${svc_name}:" "$compose_file"; then
-                warn "Cannot safely locate service '${svc_name}' in $compose_file — showing manual snippet instead."
+            if [ -z "$svc_name" ] || ! grep -qF "${svc_name}:" "$compose_path"; then
+                warn "Cannot safely locate service '${svc_name}' in $compose_path — showing manual snippet instead."
             else
-                backup_file "$compose_file"
+                backup_file "$compose_path"
 
                 # Build the label block to inject (indented 6 spaces for typical compose layout)
                 local label_block
@@ -501,22 +774,22 @@ configure_app_containers() {
         - \"wakeonrequest.start_timeout=${user_start}\""
 
                 # Check if a labels: block already exists under this service
-                if grep -qF "wakeonrequest.enable" "$compose_file"; then
-                    warn "wakeonrequest labels already present in $compose_file — skipping write."
-                elif grep -A50 "${svc_name}:" "$compose_file" | grep -qE "^[[:space:]]+labels:"; then
+                if grep -qF "wakeonrequest.enable" "$compose_path"; then
+                    warn "wakeonrequest labels already present in $compose_path — skipping write."
+                elif grep -A50 "${svc_name}:" "$compose_path" | grep -qE "^[[:space:]]+labels:"; then
                     # labels: block exists — append our entries after it
                     sed -i "/^[[:space:]]*labels:/a \\        - \"wakeonrequest.enable=true\"\n        - \"wakeonrequest.domain=${user_domain}\"\n        - \"wakeonrequest.idle_timeout=${user_idle}\"\n        - \"wakeonrequest.start_timeout=${user_start}\"" \
-                        "$compose_file"
-                    ok "Labels appended to existing labels: block in $compose_file"
+                        "$compose_path"
+                    ok "Labels appended to existing labels: block in $compose_path"
                 else
                     # No labels: block — insert one after the service name line
-                    sed -i "/^[[:space:]]*${svc_name}:/a \\${label_block}" "$compose_file"
-                    ok "Labels added to $compose_file"
+                    sed -i "/^[[:space:]]*${svc_name}:/a \\${label_block}" "$compose_path"
+                    ok "Labels added to $compose_path"
                 fi
 
                 if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
                     echo ""
-                    warn "Remember to change restart to \"no\" in $compose_file"
+                    warn "Remember to change restart to \"no\" in $compose_path"
                     warn "Then run: docker compose up -d --force-recreate $cname"
                 else
                     echo ""
@@ -525,8 +798,8 @@ configure_app_containers() {
                 continue
             fi
         else
-            if [ -n "$compose_file" ]; then
-                warn "Compose file not accessible at: $compose_file"
+            if [ -n "$compose_path" ]; then
+                warn "Compose file not accessible at: $compose_path"
             else
                 warn "No compose file found for $cname (may have been started with docker run)"
             fi
@@ -547,7 +820,7 @@ configure_app_containers() {
         echo ""
         info "Then run: docker compose up -d --force-recreate $cname"
 
-    done < <(echo "$cjson" | jq -c --arg id "$npm_id" '.[] | select(.Id != $id)')
+    done
 
     if [ "$any_unmanaged" = false ]; then
         ok "All containers are already configured."
@@ -649,13 +922,13 @@ run_install() {
     local npm_db="./data/database.sqlite"
     if [ -f "$npm_db" ]; then
         local npm_cid
-        npm_cid=$(docker compose ps -q app 2>/dev/null || true)
-        [ -z "$npm_cid" ] && npm_cid=$(docker compose ps -q nginx-proxy-manager 2>/dev/null || true)
-        [ -z "$npm_cid" ] && npm_cid=$(docker ps -q -f "name=nginx-proxy-manager" 2>/dev/null | head -n1)
-        [ -z "$npm_cid" ] && npm_cid=$(docker ps -q -f "ancestor=jc21/nginx-proxy-manager" 2>/dev/null | head -n1)
+        npm_cid=$($DOCKER_CMD compose ps -q app 2>/dev/null || true)
+        [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD compose ps -q nginx-proxy-manager 2>/dev/null || true)
+        [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "name=nginx-proxy-manager" 2>/dev/null | head -n1)
+        [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "ancestor=jc21/nginx-proxy-manager" 2>/dev/null | head -n1)
         if [ -n "$npm_cid" ]; then
             local cleaned
-            cleaned=$(docker exec "$npm_cid" sqlite3 /data/database.sqlite \
+            cleaned=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
                 "UPDATE proxy_host
                  SET    advanced_config = ''
                  WHERE  advanced_config LIKE '%wakeonrequest%';
