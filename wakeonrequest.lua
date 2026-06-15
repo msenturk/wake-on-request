@@ -223,53 +223,43 @@ end
 -- Raw HTTP/1.0 over the Unix socket.
 -- Returns: status_code (int|nil), body (string), err (string|nil)
 -- Optional timeout in milliseconds (defaults to 15000)
--- Raw HTTP/1.0 request over the Docker Unix socket.
+-- Raw HTTP request over the Docker Unix socket.
 -- @param method string: HTTP method (GET, POST, etc.)
 -- @param path string: Docker API path (e.g., "/containers/json")
 -- @param body string (optional): JSON payload for POST requests
 -- @param timeout number (optional): Socket timeout in milliseconds
 -- @return status_code number|nil, body string, err string|nil
 local function docker_request(method, path, body, timeout)
-    local sock = ngx.socket.tcp()
-    sock:settimeout(timeout or 15000)
+    local http = require("resty.http")
+    local httpc = http.new()
+    httpc:set_timeout(timeout or 15000)
 
-    local ok, err = sock:connect("unix:" .. _M.DOCKER_SOCKET)
+    local ok, err = httpc:connect("unix:" .. _M.DOCKER_SOCKET)
     if not ok then return nil, "", "socket connect: " .. (err or "?") end
 
-    local extra_headers = ""
-    local payload = body or ""
+    local req_params = {
+        path = path,
+        method = method,
+        headers = {
+            ["Host"] = "localhost"
+        }
+    }
+    
     if body then
-        extra_headers = "Content-Length: " .. #payload .. "\r\nContent-Type: application/json\r\n"
+        req_params.body = body
+        req_params.headers["Content-Type"] = "application/json"
     end
 
-    local req = method .. " " .. path .. " HTTP/1.0\r\nHost: localhost\r\n" .. extra_headers .. "\r\n" .. payload
-    local _, werr = sock:send(req)
-    if werr then sock:close(); return nil, "", "socket send: " .. werr end
-
-    local status_line = sock:receive("*l")
-    if not status_line then sock:close(); return nil, "", "no response" end
-    local code = tonumber(status_line:match("HTTP/%d%.%d (%d+)"))
-
-    local headers = {}
-    while true do
-        local line = sock:receive("*l")
-        if not line or line == "" then break end
-        local k, v = line:match("^([^:]+):%s*(.+)$")
-        if k then headers[k:lower()] = v end
+    local res, req_err = httpc:request(req_params)
+    if not res then 
+        httpc:close()
+        return nil, "", "request err: " .. (req_err or "?") 
     end
 
-    local len = tonumber(headers["content-length"])
-    local resp = ""
-    if len and len > 0 then
-        resp = sock:receive(len) or ""
-    elseif headers["transfer-encoding"] == "chunked" then
-        -- Simple chunked reader if needed, but Docker API usually sends Content-Length for these calls
-        -- For now, let's fall back to *a only if we must, or just fail safely
-        resp = sock:receive("*a") or ""
-    end
+    local resp_body, read_err = res:read_body()
+    httpc:close()
 
-    sock:close()
-    return code, resp, nil
+    return res.status, resp_body or "", nil
 end
 
 -- ── Container introspection ───────────────────────────────────────────────────
