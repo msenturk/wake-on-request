@@ -125,7 +125,7 @@ backup_file() {
     info "Backed up $file → $bak"
 }
 
-DOCKER_CMD=""
+DOCKER_CMD="${DOCKER_CMD:-}"
 detect_docker_cli() {
     if [ -n "$DOCKER_CMD" ]; then
         return 0
@@ -133,51 +133,62 @@ detect_docker_cli() {
 
     # Check if we are running under sudo and SUDO_USER is set
     if [ "${EUID:-$(id -u)}" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        local user_uid user_home sudo_env
+        user_uid=$(id -u "$SUDO_USER" 2>/dev/null || echo "")
+        user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6 2>/dev/null || echo "")
+        user_home="${user_home:-/home/$SUDO_USER}"
+        
+        # Build env prefix for the sudo command to ensure rootless podman/docker has full access
+        sudo_env="HOME=$user_home"
+        if [ -n "$user_uid" ]; then
+            sudo_env="$sudo_env XDG_RUNTIME_DIR=/run/user/$user_uid"
+        fi
+
         # 1. Prioritize daemon containing the NPM container
         local user_npm_in_podman=false
-        if sudo -u "$SUDO_USER" command -v podman >/dev/null 2>&1 && sudo -u "$SUDO_USER" podman ps -a --format '{{.Image}}' 2>/dev/null | grep -q "nginx-proxy-manager"; then
+        if sudo -u "$SUDO_USER" command -v podman >/dev/null 2>&1 && sudo -u "$SUDO_USER" env $sudo_env podman ps -a --format '{{.Image}}' 2>/dev/null | grep -q "nginx-proxy-manager"; then
             user_npm_in_podman=true
         fi
         local user_npm_in_docker=false
-        if sudo -u "$SUDO_USER" command -v docker >/dev/null 2>&1 && sudo -u "$SUDO_USER" docker ps -a --format '{{.Image}}' 2>/dev/null | grep -q "nginx-proxy-manager"; then
+        if sudo -u "$SUDO_USER" command -v docker >/dev/null 2>&1 && sudo -u "$SUDO_USER" env $sudo_env docker ps -a --format '{{.Image}}' 2>/dev/null | grep -q "nginx-proxy-manager"; then
             user_npm_in_docker=true
         fi
 
         if [ "$user_npm_in_podman" = true ] && [ "$user_npm_in_docker" = false ]; then
-            DOCKER_CMD="sudo -u $SUDO_USER podman"
+            DOCKER_CMD="sudo -u $SUDO_USER env $sudo_env podman"
             return 0
         fi
         if [ "$user_npm_in_docker" = true ] && [ "$user_npm_in_podman" = false ]; then
-            DOCKER_CMD="sudo -u $SUDO_USER docker"
+            DOCKER_CMD="sudo -u $SUDO_USER env $sudo_env docker"
             return 0
         fi
 
         # 2. Check running container count
         local user_podman_count=0
-        if sudo -u "$SUDO_USER" command -v podman >/dev/null 2>&1 && sudo -u "$SUDO_USER" podman ps -q >/dev/null 2>&1; then
-            user_podman_count=$(sudo -u "$SUDO_USER" podman ps -q | wc -l)
+        if sudo -u "$SUDO_USER" command -v podman >/dev/null 2>&1 && sudo -u "$SUDO_USER" env $sudo_env podman ps -q >/dev/null 2>&1; then
+            user_podman_count=$(sudo -u "$SUDO_USER" env $sudo_env podman ps -q | wc -l)
         fi
         local user_docker_count=0
-        if sudo -u "$SUDO_USER" command -v docker >/dev/null 2>&1 && sudo -u "$SUDO_USER" docker ps -q >/dev/null 2>&1; then
-            user_docker_count=$(sudo -u "$SUDO_USER" docker ps -q | wc -l)
+        if sudo -u "$SUDO_USER" command -v docker >/dev/null 2>&1 && sudo -u "$SUDO_USER" env $sudo_env docker ps -q >/dev/null 2>&1; then
+            user_docker_count=$(sudo -u "$SUDO_USER" env $sudo_env docker ps -q | wc -l)
         fi
 
         if [ "$user_podman_count" -gt 0 ] && [ "$user_docker_count" -eq 0 ]; then
-            DOCKER_CMD="sudo -u $SUDO_USER podman"
+            DOCKER_CMD="sudo -u $SUDO_USER env $sudo_env podman"
             return 0
         fi
         if [ "$user_docker_count" -gt 0 ] && [ "$user_podman_count" -eq 0 ]; then
-            DOCKER_CMD="sudo -u $SUDO_USER docker"
+            DOCKER_CMD="sudo -u $SUDO_USER env $sudo_env docker"
             return 0
         fi
 
         # 3. Fallback to user commands if no running containers found but binaries exist
-        if sudo -u "$SUDO_USER" command -v podman >/dev/null 2>&1 && sudo -u "$SUDO_USER" podman ps >/dev/null 2>&1; then
-            DOCKER_CMD="sudo -u $SUDO_USER podman"
+        if sudo -u "$SUDO_USER" command -v podman >/dev/null 2>&1 && sudo -u "$SUDO_USER" env $sudo_env podman ps >/dev/null 2>&1; then
+            DOCKER_CMD="sudo -u $SUDO_USER env $sudo_env podman"
             return 0
         fi
-        if sudo -u "$SUDO_USER" command -v docker >/dev/null 2>&1 && sudo -u "$SUDO_USER" docker ps >/dev/null 2>&1; then
-            DOCKER_CMD="sudo -u $SUDO_USER docker"
+        if sudo -u "$SUDO_USER" command -v docker >/dev/null 2>&1 && sudo -u "$SUDO_USER" env $sudo_env docker ps >/dev/null 2>&1; then
+            DOCKER_CMD="sudo -u $SUDO_USER env $sudo_env docker"
             return 0
         fi
     fi
@@ -235,6 +246,14 @@ detect_docker_cli() {
 has_docker() {
     detect_docker_cli
 }
+detect_host_ip() {
+    local ip
+    ip=$(ip route get 1 2>/dev/null | grep -oE 'src [0-9.]+' | cut -d' ' -f2 || echo "")
+    if [ -z "$ip" ]; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "")
+    fi
+    echo "${ip:-127.0.0.1}"
+}
 
 NPM_PROXY_HOSTS=""
 find_npm_container_id() {
@@ -271,6 +290,12 @@ find_npm_container_id() {
 
 fetch_npm_proxy_hosts() {
     if ! has_docker; then
+        if [ -f "./data/database.sqlite" ]; then
+            NPM_PROXY_HOSTS=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute('SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;'); [print(f\"{row[0]}|{row[1]}|{row[2]}\") for row in cursor.fetchall()]" 2>/dev/null || true)
+            if [ -z "$NPM_PROXY_HOSTS" ]; then
+                NPM_PROXY_HOSTS=$(sqlite3 ./data/database.sqlite "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null || echo "")
+            fi
+        fi
         return
     fi
     local npm_cid
@@ -282,29 +307,60 @@ fetch_npm_proxy_hosts() {
                 "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null || echo "")
         fi
     fi
+    if [ -z "$NPM_PROXY_HOSTS" ] && [ -f "./data/database.sqlite" ]; then
+        NPM_PROXY_HOSTS=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute('SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;'); [print(f\"{row[0]}|{row[1]}|{row[2]}\") for row in cursor.fetchall()]" 2>/dev/null || true)
+        if [ -z "$NPM_PROXY_HOSTS" ]; then
+            NPM_PROXY_HOSTS=$(sqlite3 ./data/database.sqlite "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0;" 2>/dev/null || echo "")
+        fi
+    fi
 }
 
 find_npm_config_for_container() {
     local cname="$1"
     local ips="$2"
+    local pub_ports="$3"
     matched_domain=""
     matched_port=""
+    matched_fwd_host=""
+    matched_access_type=""
 
     [ -z "$NPM_PROXY_HOSTS" ] && return 1
+
+    local host_ip
+    host_ip=$(detect_host_ip)
 
     while IFS='|' read -r domain_json fwd_host fwd_port; do
         [ -z "$domain_json" ] && continue
 
         local is_match=false
+        local access_type=""
+
+        # 1. Match by container name
         if [ "$fwd_host" = "$cname" ]; then
             is_match=true
+            access_type="name"
+        # 2. Match by container internal IP
         else
             for ip in $ips; do
                 if [ "$fwd_host" = "$ip" ]; then
                     is_match=true
+                    access_type="ip"
                     break
                 fi
             done
+        fi
+
+        # 3. Match by host IP or localhost/0.0.0.0 and published port
+        if [ "$is_match" = false ] && [ -n "$pub_ports" ]; then
+            if [ "$fwd_host" = "$host_ip" ] || [ "$fwd_host" = "127.0.0.1" ] || [ "$fwd_host" = "localhost" ] || [ "$fwd_host" = "0.0.0.0" ]; then
+                for port in $pub_ports; do
+                    if [ "$fwd_port" = "$port" ]; then
+                        is_match=true
+                        access_type="ip"
+                        break
+                    fi
+                done
+            fi
         fi
 
         if [ "$is_match" = true ]; then
@@ -312,10 +368,52 @@ find_npm_config_for_container() {
             domains=$(echo "$domain_json" | tr -d '[]"' | tr ',' ' ' | xargs)
             matched_domain=$(echo "$domains" | awk '{print $1}')
             matched_port="$fwd_port"
+            matched_fwd_host="$fwd_host"
+            matched_access_type="$access_type"
             return 0
         fi
     done <<< "$NPM_PROXY_HOSTS"
     return 1
+}
+
+count_old_snippets() {
+    local count=""
+    local npm_cid
+    npm_cid=$(find_npm_container_id)
+    if [ -n "$npm_cid" ] && $DOCKER_CMD exec "$npm_cid" test -f /data/database.sqlite >/dev/null 2>&1; then
+        count=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';\"); print(cursor.fetchone()[0])" 2>/dev/null || true)
+        if [ -z "$count" ]; then
+            count=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
+                "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null || echo "")
+        fi
+    elif [ -f "./data/database.sqlite" ]; then
+        count=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';\"); print(cursor.fetchone()[0])" 2>/dev/null || true)
+        if [ -z "$count" ]; then
+            count=$(sqlite3 ./data/database.sqlite "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null || echo "")
+        fi
+    fi
+    echo "$count"
+}
+
+clear_old_snippets() {
+    local cleaned="0"
+    local npm_cid
+    npm_cid=$(find_npm_container_id)
+    if [ -n "$npm_cid" ] && $DOCKER_CMD exec "$npm_cid" test -f /data/database.sqlite >/dev/null 2>&1; then
+        cleaned=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%';\"); conn.commit(); print(cursor.rowcount)" 2>/dev/null || true)
+        if [ -z "$cleaned" ]; then
+            cleaned=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
+                "UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%'; SELECT changes();" 2>/dev/null || echo "0")
+        fi
+    elif [ -f "./data/database.sqlite" ]; then
+        cleaned=$(python3 -c "import sqlite3; conn = sqlite3.connect('./data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%';\"); conn.commit(); print(cursor.rowcount)" 2>/dev/null || true)
+        if [ -z "$cleaned" ]; then
+            cleaned=$(sqlite3 ./data/database.sqlite "UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%'; SELECT changes();" 2>/dev/null || echo "0")
+        fi
+    else
+        cleaned=""
+    fi
+    echo "$cleaned"
 }
 
 # ── Docker Environment Scan ────────────────────────────────────────────────────
@@ -554,8 +652,8 @@ run_dry_run() {
             fi
 
             # Match against NPM SQLite database
-            local matched_domain="" matched_port=""
-            find_npm_config_for_container "$cname" "$ips" || true
+            local matched_domain="" matched_port="" matched_fwd_host="" matched_access_type=""
+            find_npm_config_for_container "$cname" "$ips" "$published_ports" || true
 
             if [ -n "$port_label" ]; then
                 detected_port="$port_label"
@@ -587,8 +685,18 @@ run_dry_run() {
 
             # Decide Forward Host recommendation
             local fwd_host fwd_port fwd_note restart_needed
-            if [ "$network" = "host" ]; then
-                fwd_host="<your-docker-host-ip>"
+            if [ -n "$matched_fwd_host" ]; then
+                fwd_host="$matched_fwd_host"
+                fwd_port="$matched_port"
+                if [ "$matched_access_type" = "name" ]; then
+                    fwd_note="NPM database config — accesses via container name"
+                    port_source="from NPM database"
+                else
+                    fwd_note="NPM database config — accesses via IP"
+                    port_source="from NPM database"
+                fi
+            elif [ "$network" = "host" ]; then
+                fwd_host=$(detect_host_ip)
                 fwd_port="${single_published:-<port>}"
                 fwd_note="host network — NPM cannot route by name"
             elif [ "$shares_network" = "true" ]; then
@@ -596,7 +704,7 @@ run_dry_run() {
                 fwd_port="${detected_port:-<port>}"
                 fwd_note="same network as NPM — use container name"
             else
-                fwd_host="<your-docker-host-ip>"
+                fwd_host=$(detect_host_ip)
                 fwd_port="${single_published:-<port>}"
                 fwd_note="different network from NPM — use host IP"
             fi
@@ -637,7 +745,16 @@ run_dry_run() {
 
             echo ""
             local label_domain="<your-domain.example.com>"
-            [ -n "$matched_domain" ] && label_domain="$matched_domain"
+            if [ -n "$matched_domain" ]; then
+                label_domain="$matched_domain"
+            elif [ -n "$domain" ]; then
+                label_domain="$domain"
+            fi
+
+            local ip_labels=""
+            if [[ "$fwd_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                ip_labels="     ${GREEN}  - \"wakeonrequest.probe_host=${fwd_host}\"${NC}\n     ${GREEN}  - \"wakeonrequest.port=${fwd_port}\"${NC}"
+            fi
 
             if [ -n "$compose_path" ] && [ -f "$compose_path" ]; then
                 if grep -qF "wakeonrequest.enable" "$compose_path"; then
@@ -645,7 +762,7 @@ run_dry_run() {
                 else
                     change "Compose File : ${YELLOW}Will patch${NC} at ${BLUE}$compose_path${NC}"
                     echo ""
-                    echo -e "     ${BOLD}── Proposed changes for $compose_path ──${NC}"
+                    echo -e "     ${BOLD}── Proposed changes for $compose_path (Method A) ──${NC}"
                     echo ""
                     if [ "$restart_needed" = "true" ]; then
                         echo -e "     ${YELLOW}restart: \"no\"${NC}                                  ${BLUE}# change from: $restart${NC}"
@@ -655,12 +772,15 @@ run_dry_run() {
                     echo -e "     ${GREEN}  - \"wakeonrequest.domain=${label_domain}\"${NC}  ${BLUE}# ← your NPM domain${NC}"
                     echo -e "     ${GREEN}  - \"wakeonrequest.idle_timeout=300\"${NC}                  ${BLUE}# stop after 5 min idle${NC}"
                     echo -e "     ${GREEN}  - \"wakeonrequest.start_timeout=30\"${NC}                  ${BLUE}# wait up to 30s on wake${NC}"
+                    if [ -n "$ip_labels" ]; then
+                        echo -e "$ip_labels"
+                    fi
                     echo ""
                 fi
             else
                 warn "Compose File : ${RED}Not found${NC} (checked: ${YELLOW}${compose_path:-none}${NC})"
                 echo ""
-                echo -e "     ${BOLD}── Add to $cname's docker-compose.yml manually ──${NC}"
+                echo -e "     ${BOLD}── Add to $cname's docker-compose.yml manually (Method A) ──${NC}"
                 echo ""
                 if [ "$restart_needed" = "true" ]; then
                     echo -e "     ${YELLOW}restart: \"no\"${NC}                                  ${BLUE}# change from: $restart${NC}"
@@ -670,8 +790,23 @@ run_dry_run() {
                 echo -e "     ${GREEN}  - \"wakeonrequest.domain=${label_domain}\"${NC}  ${BLUE}# ← your NPM domain${NC}"
                 echo -e "     ${GREEN}  - \"wakeonrequest.idle_timeout=300\"${NC}                  ${BLUE}# stop after 5 min idle${NC}"
                 echo -e "     ${GREEN}  - \"wakeonrequest.start_timeout=30\"${NC}                  ${BLUE}# wait up to 30s on wake${NC}"
+                if [ -n "$ip_labels" ]; then
+                    echo -e "$ip_labels"
+                fi
                 echo ""
             fi
+
+            # ── NPM Advanced Tab Config (Method B) ──
+            echo -e "     ${BOLD}── NPM Advanced Tab Config (Method B) ──${NC}"
+            echo ""
+            echo -e "     ${GREEN}set \$wake_container     \"${cname}\";${NC}"
+            echo -e "     ${GREEN}set \$wake_idle_timeout  300;${NC}"
+            echo -e "     ${GREEN}set \$wake_start_timeout 30;${NC}"
+            if [[ "$fwd_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo -e "     ${GREEN}set \$wake_probe_host    \"${fwd_host}\";${NC}       ${BLUE}# cross-network probe IP${NC}"
+                echo -e "     ${GREEN}set \$wake_port          ${fwd_port:-80};${NC}    ${BLUE}# cross-network probe port${NC}"
+            fi
+            echo ""
         done
     else
         warn "Docker socket or daemon not available — skipping container scan."
@@ -679,34 +814,16 @@ run_dry_run() {
 
     # ── NPM Database Status ───────────────────────────────────────────────────
     section "NPM Database Status"
-    local npm_db="./data/database.sqlite"
-    if [ -f "$npm_db" ]; then
-        if has_docker; then
-            local npm_cid
-            npm_cid=$($DOCKER_CMD compose ps -q app 2>/dev/null || true)
-            [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD compose ps -q nginx-proxy-manager 2>/dev/null || true)
-            [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "name=nginx-proxy-manager" 2>/dev/null | head -n1)
-            [ -z "$npm_cid" ] && npm_cid=$($DOCKER_CMD ps -q -f "ancestor=jc21/nginx-proxy-manager" 2>/dev/null | head -n1)
-            if [ -n "$npm_cid" ]; then
-                local count
-                count=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';\"); print(cursor.fetchone()[0])" 2>/dev/null || true)
-                if [ -z "$count" ]; then
-                    count=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
-                        "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%';" 2>/dev/null || echo "")
-                fi
-                if [ -n "$count" ] && [ "$count" -gt 0 ] 2>/dev/null; then
-                    change "NPM Database: Will clear old Lua snippets from $count proxy host(s) in Advanced tab."
-                else
-                    ok "NPM Database: No old Lua snippets to clean."
-                fi
-            else
-                warn "NPM container is not running — skipping database check."
-            fi
+    local count
+    count=$(count_old_snippets)
+    if [ -n "$count" ]; then
+        if [ "$count" -gt 0 ] 2>/dev/null; then
+            change "NPM Database: Will clear old Lua snippets from $count proxy host(s) in Advanced tab."
         else
-            warn "Docker socket not accessible — skipping database check."
+            ok "NPM Database: No old Lua snippets to clean."
         fi
     else
-        info "No NPM database found at $npm_db — skipping database check."
+        info "No NPM database found or accessible — skipping database check."
     fi
 
     # ── Summary ───────────────────────────────────────────────────────────────
@@ -825,19 +942,20 @@ configure_app_containers() {
         local default_port=""
         
         # 1. Search in NPM SQLite database
-        local matched_domain="" matched_port=""
-        find_npm_config_for_container "$cname" "$ips" || true
+        local matched_domain="" matched_port="" matched_fwd_host="" matched_access_type=""
+        find_npm_config_for_container "$cname" "$ips" "$published_ports" || true
         
         if [ -n "$matched_domain" ]; then
             default_domain="$matched_domain"
             default_port="$matched_port"
             port_source="from NPM database"
+        elif [ -n "$domain" ]; then
+            default_domain="$domain"
+            default_port="$port_label"
+            port_source="from existing labels"
         else
             # Fallback to standard exposed/published port detection
-            if [ -n "$port_label" ]; then
-                default_port="$port_label"
-                port_source="from label"
-            elif [ -n "$single_exposed" ]; then
+            if [ -n "$single_exposed" ]; then
                 default_port="$single_exposed"
                 port_source="auto-detected"
             elif [ -n "$single_published" ]; then
@@ -862,21 +980,30 @@ configure_app_containers() {
 
         # Decide Forward Host recommendation
         local fwd_host
-        if [ "$network" = "host" ]; then
-            fwd_host="<your-docker-host-ip>"
+        if [ -n "$matched_fwd_host" ]; then
+            fwd_host="$matched_fwd_host"
+        elif [ "$network" = "host" ]; then
+            fwd_host=$(detect_host_ip)
         elif [ "$shares_network" = "true" ]; then
             fwd_host="$cname"
         else
-            fwd_host="<your-docker-host-ip>"
+            fwd_host=$(detect_host_ip)
         fi
 
         # ── Print container summary ───────────────────────────────────────────
         echo ""
         echo -e "  ${YELLOW}➕ ${BOLD}$cname${NC}  [state: $state | restart: $restart]"
         if [ -n "$default_domain" ]; then
-            echo -e "     NPM Domain       : ${GREEN}$default_domain${NC}  ${BLUE}(auto-detected from database)${NC}"
+            echo -e "     NPM Domain       : ${GREEN}$default_domain${NC}  ${BLUE}($port_source)${NC}"
         fi
         echo -e "     NPM Forward Host : ${GREEN}$fwd_host${NC}"
+        if [ -n "$matched_fwd_host" ]; then
+            if [ "$matched_access_type" = "name" ]; then
+                echo -e "     Forward Note     : ${BLUE}accesses via container name (from NPM database)${NC}"
+            else
+                echo -e "     Forward Note     : ${BLUE}accesses via IP (from NPM database)${NC}"
+            fi
+        fi
         if [ -n "$default_port" ] && [ "$default_port" != "<port>" ]; then
             echo -e "     NPM Forward Port : ${GREEN}$default_port${NC}  ${BLUE}($port_source)${NC}"
         else
@@ -887,21 +1014,30 @@ configure_app_containers() {
             echo -e "        ${BLUE}(wake-on-request cannot stop containers with auto-restart)${NC}"
         fi
 
-        # ── Ask whether to configure this container ───────────────────────────
+        # ── Ask configuration method ──────────────────────────────────────────
         echo ""
-        local prompt_msg="Configure wake-on-request for $cname"
-        if [ -n "$default_domain" ]; then
-            prompt_msg="$prompt_msg (domain: $default_domain, port: $default_port)"
+        echo -e "     Choose configuration method for ${BOLD}$cname${NC}:"
+        echo -e "       [1] Use Docker Labels (Method A — Recommended)"
+        echo -e "       [2] Use NPM Advanced Tab (Method B)"
+        echo -e "       [3] Skip this container"
+        echo ""
+        printf "     Enter option [1-3] (default: 1): "
+        
+        local answer=""
+        if [ -t 0 ] && [ -c /dev/tty ]; then
+            read -r answer </dev/tty || answer="3"
+        else
+            read -r answer || answer="3"
         fi
-        printf "     %s? [Y/n] " "$prompt_msg"
-        local answer
-        read -r answer </dev/tty
-        if [ -z "$answer" ]; then
-            answer="y"
-        fi
-        if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        [ -z "$answer" ] && answer="1"
+
+        if [ "$answer" = "3" ]; then
             info "Skipped $cname"
             continue
+        elif [ "$answer" = "2" ]; then
+            local method="B"
+        else
+            local method="A"
         fi
 
         # ── Resolve domain ────────────────────────────────────────────────────
@@ -910,7 +1046,11 @@ configure_app_containers() {
         else
             while [ -z "$user_domain" ]; do
                 printf "     NPM domain for %s (e.g. app.example.com): " "$cname"
-                read -r user_domain </dev/tty
+                if [ -t 0 ] && [ -c /dev/tty ]; then
+                    read -r user_domain </dev/tty || user_domain=""
+                else
+                    read -r user_domain || user_domain=""
+                fi
                 user_domain="${user_domain// /}"   # strip accidental spaces
             done
         fi
@@ -918,14 +1058,22 @@ configure_app_containers() {
         # ── Prompt for idle timeout ───────────────────────────────────────────
         local user_idle=""
         printf "     Idle timeout in seconds [300]: "
-        read -r user_idle </dev/tty
+        if [ -t 0 ] && [ -c /dev/tty ]; then
+            read -r user_idle </dev/tty || user_idle=""
+        else
+            read -r user_idle || user_idle=""
+        fi
         user_idle="${user_idle// /}"
         [ -z "$user_idle" ] && user_idle="300"
 
         # ── Prompt for start timeout ──────────────────────────────────────────
         local user_start=""
         printf "     Start timeout in seconds [30]: "
-        read -r user_start </dev/tty
+        if [ -t 0 ] && [ -c /dev/tty ]; then
+            read -r user_start </dev/tty || user_start=""
+        else
+            read -r user_start || user_start=""
+        fi
         user_start="${user_start// /}"
         [ -z "$user_start" ] && user_start="30"
 
@@ -938,35 +1086,84 @@ configure_app_containers() {
             fi
         fi
 
-        # ── Locate and patch the compose file ────────────────────────────────
-        if [ -n "$compose_path" ] && [ -f "$compose_path" ]; then
-            echo ""
-            info "Found compose file: $compose_path"
-
-            # Safety check: only patch if we can find the service name in the file
-            if [ -z "$svc_name" ] || ! grep -qF "${svc_name}:" "$compose_path"; then
-                warn "Cannot safely locate service '${svc_name}' in $compose_path — showing manual snippet instead."
-            else
-                backup_file "$compose_path"
-
-                # Build the label block to inject (indented 6 spaces for typical compose layout)
-                local label_block
-                label_block="      labels:\n\
+        # ── Build the proposed additions/changes ──────────────────────────────
+        local label_block append_content ip_labels_text
+        label_block="      labels:\n\
         - \"wakeonrequest.enable=true\"\n\
         - \"wakeonrequest.domain=${user_domain}\"\n\
         - \"wakeonrequest.idle_timeout=${user_idle}\"\n\
         - \"wakeonrequest.start_timeout=${user_start}\""
 
-                # Check if a labels: block already exists under this service
+        append_content="        - \"wakeonrequest.enable=true\"\n        - \"wakeonrequest.domain=${user_domain}\"\n        - \"wakeonrequest.idle_timeout=${user_idle}\"\n        - \"wakeonrequest.start_timeout=${user_start}\""
+
+        ip_labels_text=""
+        if [[ "$fwd_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            label_block="${label_block}\n\
+        - \"wakeonrequest.probe_host=${fwd_host}\"\n\
+        - \"wakeonrequest.port=${default_port:-80}\""
+            append_content="${append_content}\n        - \"wakeonrequest.probe_host=${fwd_host}\"\n        - \"wakeonrequest.port=${default_port:-80}\""
+            ip_labels_text="     ${GREEN}    - \"wakeonrequest.probe_host=${fwd_host}\"${NC}\n     ${GREEN}    - \"wakeonrequest.port=${default_port:-80}\"${NC}"
+        fi
+
+        # ── Show Proposed Changes ─────────────────────────────────────────────
+        echo ""
+        if [ "$method" = "B" ]; then
+            info "Paste this configuration snippet into Nginx Proxy Manager's Advanced Tab for ${BOLD}${user_domain}${NC}:"
+            echo ""
+            echo -e "     ${GREEN}set \$wake_container     \"${cname}\";${NC}"
+            echo -e "     ${GREEN}set \$wake_idle_timeout  ${user_idle};${NC}"
+            echo -e "     ${GREEN}set \$wake_start_timeout ${user_start};${NC}"
+            if [[ "$fwd_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo -e "     ${GREEN}set \$wake_probe_host    \"${fwd_host}\";${NC}       ${BLUE}# cross-network probe IP${NC}"
+                echo -e "     ${GREEN}set \$wake_port          ${default_port:-80};${NC}    ${BLUE}# cross-network probe port${NC}"
+            fi
+            echo ""
+            if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+                warn "Remember to change restart to \"no\" manually for $cname if needed"
+            fi
+            continue
+        fi
+
+        if [ -n "$compose_path" ] && [ -f "$compose_path" ]; then
+            info "Proposed changes for $compose_path:"
+            echo ""
+            if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
+                echo -e "     ${YELLOW}restart: \"no\"${NC}                                  ${BLUE}# change from: $restart${NC}"
+            fi
+            if grep -qF "wakeonrequest.enable" "$compose_path"; then
+                warn "wakeonrequest labels already present in $compose_path — this will skip writing."
+            elif grep -A50 "${svc_name}:" "$compose_path" | grep -qE "^[[:space:]]+labels:"; then
+                echo -e "     ${GREEN}labels: (append to existing block)${NC}"
+                echo -e "     ${GREEN}${append_content}${NC}"
+            else
+                echo -e "     ${GREEN}${label_block}${NC}"
+            fi
+            echo ""
+
+            # Safety check: only patch if we can find the service name in the file
+            if [ -z "$svc_name" ] || ! grep -qF "${svc_name}:" "$compose_path"; then
+                warn "Cannot safely locate service '${svc_name}' in $compose_path — showing manual snippet instead."
+            else
+                printf "     Apply these changes to %s? [Y/n] " "$compose_path"
+                local apply_ans
+                read -r apply_ans </dev/tty
+                if [ -z "$apply_ans" ]; then
+                    apply_ans="y"
+                fi
+                if [[ ! "$apply_ans" =~ ^[Yy]$ ]]; then
+                    info "Skipped writing to $compose_path"
+                    continue
+                fi
+
+                # ── Apply changes ──────────────────────────────────────────────────
                 if grep -qF "wakeonrequest.enable" "$compose_path"; then
                     warn "wakeonrequest labels already present in $compose_path — skipping write."
                 elif grep -A50 "${svc_name}:" "$compose_path" | grep -qE "^[[:space:]]+labels:"; then
-                    # labels: block exists — append our entries after it
-                    sed -i "/^[[:space:]]*labels:/a \\        - \"wakeonrequest.enable=true\"\n        - \"wakeonrequest.domain=${user_domain}\"\n        - \"wakeonrequest.idle_timeout=${user_idle}\"\n        - \"wakeonrequest.start_timeout=${user_start}\"" \
-                        "$compose_path"
+                    backup_file "$compose_path"
+                    sed -i "/^[[:space:]]*labels:/a \\${append_content}" "$compose_path"
                     ok "Labels appended to existing labels: block in $compose_path"
                 else
-                    # No labels: block — insert one after the service name line
+                    backup_file "$compose_path"
                     sed -i "/^[[:space:]]*${svc_name}:/a \\${label_block}" "$compose_path"
                     ok "Labels added to $compose_path"
                 fi
@@ -991,7 +1188,7 @@ configure_app_containers() {
 
         # ── Fallback: print the snippet to add manually ───────────────────────
         echo ""
-        echo -e "     ${BOLD}Add this to ${cname}'s docker-compose.yml:${NC}"
+        echo -e "     ${BOLD}Add this to ${cname}'s docker-compose.yml manually:${NC}"
         echo ""
         if [ "$restart" = "always" ] || [ "$restart" = "unless-stopped" ]; then
             echo -e "     ${YELLOW}  restart: \"no\"${NC}  ${BLUE}# change from: $restart${NC}"
@@ -1001,6 +1198,9 @@ configure_app_containers() {
         echo -e "     ${GREEN}    - \"wakeonrequest.domain=${user_domain}\"${NC}"
         echo -e "     ${GREEN}    - \"wakeonrequest.idle_timeout=${user_idle}\"${NC}"
         echo -e "     ${GREEN}    - \"wakeonrequest.start_timeout=${user_start}\"${NC}"
+        if [ -n "$ip_labels_text" ]; then
+            echo -e "$ip_labels_text"
+        fi
         echo ""
         info "Then run: docker compose up -d --force-recreate $cname"
 
@@ -1103,31 +1303,23 @@ run_install() {
 
     # ── Clean up old NPM database snippets ────────────────────────────────────
     section "Cleaning NPM Database"
-    local npm_db="./data/database.sqlite"
-    if [ -f "$npm_db" ]; then
-        local npm_cid
-        npm_cid=$(find_npm_container_id)
-        if [ -n "$npm_cid" ]; then
-            local cleaned
-            cleaned=$($DOCKER_CMD exec "$npm_cid" python3 -c "import sqlite3; conn = sqlite3.connect('/data/database.sqlite'); cursor = conn.cursor(); cursor.execute(\"UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%';\"); conn.commit(); print(cursor.rowcount)" 2>/dev/null || true)
-            if [ -z "$cleaned" ]; then
-                cleaned=$($DOCKER_CMD exec "$npm_cid" sqlite3 /data/database.sqlite \
-                    "UPDATE proxy_host
-                     SET    advanced_config = ''
-                     WHERE  advanced_config LIKE '%wakeonrequest%';
-                     SELECT changes();" 2>/dev/null || echo "0")
-            fi
-            if [ "$cleaned" != "0" ] && [ -n "$cleaned" ]; then
-                ok "Cleared old Lua snippets from $cleaned proxy host(s)."
-            else
-                ok "No old snippets found — nothing to clean."
-            fi
+    local cleaned
+    cleaned=$(clear_old_snippets)
+    if [ -n "$cleaned" ]; then
+        if [ "$cleaned" != "0" ] && [ -n "$cleaned" ]; then
+            ok "Cleared old Lua snippets from $cleaned proxy host(s)."
         else
-            warn "NPM container is not running — skipping database cleanup."
-            info "After starting NPM, clear any 'access_by_lua_block' from Proxy Host Advanced tabs."
+            ok "No old snippets found — nothing to clean."
         fi
     else
-        info "No NPM database found at $npm_db — skipping cleanup."
+        info "No NPM database found or accessible — skipping cleanup."
+    fi
+
+    # ── Configure App Containers ──────────────────────────────────────────────
+    if [ -t 0 ] && [ -t 1 ]; then
+        configure_app_containers
+    else
+        info "Non-interactive environment detected — skipping interactive app configuration."
     fi
 
     # ── Next Steps ────────────────────────────────────────────────────────────
@@ -1144,10 +1336,12 @@ run_install() {
     echo -e "  ${BOLD}2.${NC} For each app you want to manage, add labels to its docker-compose.yml:"
     echo ""
     echo -e "     ${GREEN}labels:${NC}"
-    echo -e "     ${GREEN}  - \"wakeonrequest.enable=true\"${NC}"
-    echo -e "     ${GREEN}  - \"wakeonrequest.domain=yourapp.example.com\"${NC}   ${BLUE}# must match your NPM domain${NC}"
-    echo -e "     ${GREEN}  - \"wakeonrequest.idle_timeout=300\"${NC}             ${BLUE}# stop after 5 min idle${NC}"
-    echo -e "     ${GREEN}  - \"wakeonrequest.start_timeout=30\"${NC}             ${BLUE}# wait up to 30s on wake${NC}"
+    echo -e "     ${GREEN}  - \"wakeonrequest.enable=true\"${NC}             ${BLUE}# required — opt-in app for wake-on-request${NC}"
+    echo -e "     ${GREEN}  - \"wakeonrequest.domain=yourapp.example.com\"${NC}   ${BLUE}# required — comma-separated NPM domains${NC}"
+    echo -e "     ${GREEN}  - \"wakeonrequest.idle_timeout=300\"${NC}             ${BLUE}# optional — stop after 5 min idle (default: 300s)${NC}"
+    echo -e "     ${GREEN}  - \"wakeonrequest.start_timeout=30\"${NC}             ${BLUE}# optional — wait up to 30s on wake (default: 30s)${NC}"
+    echo -e "     ${GREEN}  - \"wakeonrequest.probe_host=192.168.1.103\"${NC}     ${BLUE}# optional — IP to probe for readiness (defaults to container name)${NC}"
+    echo -e "     ${GREEN}  - \"wakeonrequest.port=8080\"${NC}                    ${BLUE}# optional — port to probe (defaults to exposed port)${NC}"
     echo -e "     ${YELLOW}  restart: \"no\"${NC}                                  ${BLUE}# required — allows idle stop${NC}"
     echo ""
     echo -e "  ${BOLD}3.${NC} Then recreate the app container:"

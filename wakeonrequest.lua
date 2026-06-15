@@ -22,12 +22,14 @@
 --
 --   Method B — NPM Advanced Tab (per-host override, no labels needed):
 --     Paste into the Advanced tab of a specific Proxy Host:
---       set $wake_container   "my-container";  # required
---       set $wake_idle_timeout  300;            # optional
+--       set $wake_container      "my-container";  # required
+--       set $wake_idle_timeout   300;            # optional
 --       set $wake_start_timeout  30;            # optional
 --       set $wake_timer_interval 60;            # optional (idle-check interval)
 --       set $wake_poll_interval  0.5;           # optional (startup poll interval)
---       set $wake_splash        "true";         # optional (default: true)
+--       set $wake_splash         "true";         # optional (default: true)
+--       set $wake_probe_host     "192.168.1.103";# optional (cross-network probe IP)
+--       set $wake_port           8080;           # optional (cross-network probe port)
 --
 -- GLOBAL CONFIG (npm-custom/http_top.conf — set once, never edit again):
 --   lua_shared_dict wakeonrequest_state 1m;
@@ -547,7 +549,9 @@ function _M.wake(name, opts)
     end
 
     local target_ip = nil
-    if data.Config and data.Config.Labels and data.Config.Labels["wakeonrequest.probe_host"] then
+    if opts and opts.probe_host and opts.probe_host ~= "" then
+        target_ip = opts.probe_host
+    elseif data.Config and data.Config.Labels and data.Config.Labels["wakeonrequest.probe_host"] then
         target_ip = data.Config.Labels["wakeonrequest.probe_host"]
     elseif data.NetworkSettings and data.NetworkSettings.Networks then
         for _, net in pairs(data.NetworkSettings.Networks) do
@@ -558,7 +562,9 @@ function _M.wake(name, opts)
     end
 
     local detected_port = nil
-    if data.Config then
+    if opts and opts.port and opts.port ~= "" then
+        detected_port = tostring(opts.port)
+    elseif data.Config then
         detected_port = (data.Config.Labels and data.Config.Labels["wakeonrequest.port"]) or nil
         if not detected_port and data.Config.ExposedPorts then
             local ports = {}
@@ -651,7 +657,9 @@ function _M.global_wake()
         start_timeout = ngx.var.wake_start_timeout,
         timer_interval = ngx.var.wake_timer_interval,
         poll_interval = ngx.var.wake_poll_interval,
-        splash = (ngx.var.wake_splash ~= "false")
+        splash = (ngx.var.wake_splash ~= "false"),
+        probe_host = ngx.var.wake_probe_host,
+        port = ngx.var.wake_port
     }
 
     _M.wake(name, opts)

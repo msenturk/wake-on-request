@@ -8,6 +8,7 @@
 # ==============================================================================
 
 set -e
+export DOCKER_CMD="true"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -142,11 +143,120 @@ EOF
     cleanup_test_env
 }
 
+# --- Test 5: Help flag output ---
+test_help_argument() {
+    echo -e "\n${BLUE}🧪 Test 5: Help flag output${NC}"
+    setup_test_env
+    if ! "$INSTALLER_PATH" --help | grep -q "Wake-On-Request Installer"; then
+        echo -e "${RED}❌ FAILED: --help output invalid or flag failed${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ PASSED: Help output verified successfully.${NC}"
+    cleanup_test_env
+}
+
+# --- Test 6: Invalid path parameter behavior ---
+test_invalid_path_flag() {
+    echo -e "\n${BLUE}🧪 Test 6: Invalid path parameter behavior${NC}"
+    setup_test_env
+    if "$INSTALLER_PATH" --path /non-existent-directory-xyz > /dev/null 2>&1; then
+        echo -e "${RED}❌ FAILED: Script should fail with invalid directory path${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ PASSED: Invalid path flag failed correctly.${NC}"
+    cleanup_test_env
+}
+
+# --- Test 7: Dry-run preview mode ---
+test_dry_run_preview() {
+    echo -e "\n${BLUE}🧪 Test 7: Dry-run preview mode${NC}"
+    setup_test_env
+    cat << 'EOF' > docker-compose.yml
+services:
+  npm:
+    image: jc21/nginx-proxy-manager
+    volumes:
+      - ./data:/data
+EOF
+    if ! "$INSTALLER_PATH" --dry-run | grep -q "Wake-On-Request — Dry Run Preview"; then
+        echo -e "${RED}❌ FAILED: Dry-run output missing preview header${NC}"
+        exit 1
+    fi
+    # Verify no files were actually modified or created
+    if [ -f "wakeonrequest.lua" ] || [ -d "npm-custom" ]; then
+        echo -e "${RED}❌ FAILED: Dry-run created files on disk${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ PASSED: Dry-run mode completed successfully with no writes.${NC}"
+    cleanup_test_env
+}
+
+# --- Test 8: Database check and cleanup ---
+test_database_cleanup() {
+    echo -e "\n${BLUE}🧪 Test 8: NPM database check and advanced_config cleanup${NC}"
+    setup_test_env
+    
+    cat << 'EOF' > docker-compose.yml
+services:
+  npm:
+    image: jc21/nginx-proxy-manager
+    volumes:
+      - ./data:/data
+EOF
+
+    # Setup dummy sqlite database structure
+    mkdir -p data
+    python3 -c "
+import sqlite3
+conn = sqlite3.connect('data/database.sqlite')
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS proxy_host (
+        id INTEGER PRIMARY KEY,
+        domain_names TEXT,
+        forward_host TEXT,
+        forward_port INTEGER,
+        is_deleted INTEGER,
+        advanced_config TEXT
+    )
+''')
+cursor.execute('''
+    INSERT INTO proxy_host (id, domain_names, forward_host, forward_port, is_deleted, advanced_config)
+    VALUES (1, '[\"app.example.com\"]', 'app-container', 80, 0, 'access_by_lua_block { require(\"wakeonrequest\") }')
+''')
+conn.commit()
+"
+    
+    # Run installer
+    "$INSTALLER_PATH" > /dev/null 2>&1
+    
+    # Query database to ensure advanced_config is cleared
+    local cleaned_config
+    cleaned_config=$(python3 -c "
+import sqlite3
+conn = sqlite3.connect('data/database.sqlite')
+cursor = conn.cursor()
+cursor.execute('SELECT advanced_config FROM proxy_host WHERE id=1')
+print(cursor.fetchone()[0])
+")
+    
+    if [ -n "$cleaned_config" ]; then
+        echo -e "${RED}❌ FAILED: Database advanced_config was not cleared ($cleaned_config)${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✅ PASSED: SQLite database query and cleanup verified successfully.${NC}"
+    cleanup_test_env
+}
+
 # --- Run All Tests ---
 echo -e "${BLUE}🏁 Starting Test Suite...${NC}"
 test_fail_no_compose
 test_fresh_install
 test_idempotency
 test_backups
+test_help_argument
+test_invalid_path_flag
+test_dry_run_preview
+test_database_cleanup
 
 echo -e "\n${GREEN}🌟 ALL TESTS PASSED SUCCESSFULLY!${NC}\n"
