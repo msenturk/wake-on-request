@@ -1605,6 +1605,7 @@ class TestConfigureContainers:
         docker = self.make_docker_with_container()
         db = MagicMock()
         db.find_config_for.return_value = None
+        db.write_advanced_config.return_value = 1
         args = MagicMock()
 
         prompts = iter(["2", "myapp.example.com", "300", "30"])
@@ -1614,6 +1615,7 @@ class TestConfigureContainers:
 
         out = capsys.readouterr().out
         assert "wake_container" in out
+        db.write_advanced_config.assert_called_once()
 
     def test_method_a_patches_compose(self, tmp_dir, npm_compose, capsys):
         docker = self.make_docker_with_container(

@@ -693,6 +693,48 @@ class NpmDatabase:
                 return cur.rowcount
         except Exception:
             return None
+    def write_advanced_config(self, domain: str, snippet: str) -> Optional[int]:
+        """Inject `snippet` into the NPM advanced_config column for the proxy host
+        matching `domain`. Uses parameterized queries to prevent SQL injection.
+        Returns the number of rows updated, or None on failure.
+        """
+        npm_cid = self._get_npm_cid()
+
+        # Strategy 1: direct local SQLite file (safest — no shell involved)
+        db = self._find_npm_db_via_inspect(npm_cid) if npm_cid else None
+        if not db:
+            db = self._local_db()
+        if db:
+            try:
+                with sqlite3.connect(str(db)) as conn:
+                    cur = conn.execute(
+                        "UPDATE proxy_host SET advanced_config = ? "
+                        "WHERE is_deleted = 0 AND domain_names LIKE ?",
+                        (snippet, f'%{domain}%'),
+                    )
+                    conn.commit()
+                    return cur.rowcount
+            except Exception:
+                pass
+
+        # Strategy 2: docker exec python3 with escaped snippet
+        if npm_cid:
+            snippet_escaped = snippet.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+            domain_escaped  = domain.replace("'", "\\'")
+            py_cmd = (
+                "import sqlite3; conn=sqlite3.connect('/data/database.sqlite'); "
+                f"cur=conn.execute(\"UPDATE proxy_host SET advanced_config=? "
+                f"WHERE is_deleted=0 AND domain_names LIKE ?\","
+                f"['{snippet_escaped}','%{domain_escaped}%']); conn.commit(); print(cur.rowcount)"
+            )
+            out = self._docker.run_exec(npm_cid, ["python3", "-c", py_cmd])
+            if out and out.strip():
+                try:
+                    return int(out.strip())
+                except ValueError:
+                    pass
+
+        return None
 
 
 # ── Compose File Resolver ──────────────────────────────────────────────────────
@@ -1314,6 +1356,29 @@ def configure_containers(
                 probe_port = str(default_port) if default_port else '80'
                 print("     " + Console.green('set $wake_probe_host    "' + fwd_host + '";') + "       " + Console.blue('# probe host'))
                 print("     " + Console.green('set $wake_port          ' + probe_port + ';') + "    " + Console.blue('# probe port'))
+            print()
+
+            snippet_lines = [
+                f'set $wake_container     "{info.name}";',
+                f'set $wake_idle_timeout  {user_idle};',
+                f'set $wake_start_timeout {user_start};',
+            ]
+            if fwd_host:
+                probe_port = str(default_port) if default_port else '80'
+                snippet_lines += [
+                    f'set $wake_probe_host    "{fwd_host}";',
+                    f'set $wake_port          {probe_port};',
+                ]
+            snippet = "\n".join(snippet_lines)
+
+            rows = db.write_advanced_config(user_domain, snippet)
+            if rows and rows > 0:
+                Console.ok(f"Advanced config written to NPM database for {user_domain} ({rows} row(s)).")
+                Console.info("NPM will pick up the change within seconds — no restart needed.")
+            else:
+                Console.warn("Could not write to NPM database automatically.")
+                Console.info("Please paste the config shown above into NPM's Advanced Tab manually.")
+
             if info.restart_problematic:
                 Console.warn(f'Remember to change restart to "no" manually for {info.name} if needed')
             continue
