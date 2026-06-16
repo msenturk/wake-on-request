@@ -1276,6 +1276,11 @@ def configure_containers(
         ):
             continue
 
+        # --container filter: skip all other containers
+        target_name = getattr(args, "container", None)
+        if target_name and info.name != target_name:
+            continue
+
         # Already configured
         if info.enabled == "true" and info.domain:
             idle = info.idle_timeout or "300"
@@ -1596,6 +1601,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--path", "-p", metavar="DIR", help="Target NPM directory (defaults to current directory)"
     )
     parser.add_argument(
+        "--container", "-c", metavar="NAME",
+        help="Only configure this specific container (by name)"
+    )
+    parser.add_argument(
         "target_dir", nargs="?", default=None, help="Target directory (positional)"
     )
     return parser
@@ -1609,6 +1618,7 @@ def show_usage(parser: argparse.ArgumentParser) -> None:
     print("Options:")
     print("  --dry-run                Preview what will change, no files written")
     print("  --npm, -npm <container>  Manually specify the Nginx Proxy Manager container name/ID")
+    print("  --container, -c <name>   Only configure a specific container by name")
     print("  --path, -p <dir>         Target NPM directory (defaults to current directory)")
     print("  -h, --help               Show this help message and exit")
     print()

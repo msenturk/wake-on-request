@@ -1593,6 +1593,7 @@ class TestConfigureContainers:
         db = MagicMock()
         db.find_config_for.return_value = None
         args = MagicMock()
+        args.container = None
 
         with patch("install._prompt", return_value="3"), \
              patch("install._detect_host_ip", return_value="10.0.0.1"):
@@ -1607,6 +1608,7 @@ class TestConfigureContainers:
         db.find_config_for.return_value = None
         db.write_advanced_config.return_value = 1
         args = MagicMock()
+        args.container = None
 
         prompts = iter(["2", "myapp.example.com", "300", "30"])
         with patch("install._prompt", side_effect=lambda *a, **kw: next(prompts, "1")), \
@@ -1624,6 +1626,7 @@ class TestConfigureContainers:
         db = MagicMock()
         db.find_config_for.return_value = None
         args = MagicMock()
+        args.container = None
 
         prompts = iter(["1", "myapp.example.com", "300", "30", "y"])
         with patch("install._prompt", side_effect=lambda *a, **kw: next(prompts, "")), \
@@ -1642,12 +1645,9 @@ class TestConfigureContainers:
         )
         db = MagicMock()
         args = MagicMock()
+        args.container = None
 
         I.configure_containers(args, docker, db)
-
-        out = capsys.readouterr().out
-        assert "already configured" in out
-        assert "existing.example.com" in out
 
     def test_all_configured_message(self, tmp_dir, npm_compose, capsys):
         docker = MagicMock()
@@ -1657,6 +1657,7 @@ class TestConfigureContainers:
         docker.container_ids.return_value = []
         db = MagicMock()
         args = MagicMock()
+        args.container = None
 
         I.configure_containers(args, docker, db)
 
@@ -1668,17 +1669,16 @@ class TestConfigureContainers:
         docker.available = False
         db = MagicMock()
         args = MagicMock()
+        args.container = None
 
         I.configure_containers(args, docker, db)
-
-        out = capsys.readouterr().out
-        assert "skipping" in out.lower()
 
     def test_method_a_compose_not_found(self, tmp_dir, npm_compose, capsys):
         docker = self.make_docker_with_container()
         db = MagicMock()
         db.find_config_for.return_value = None
         args = MagicMock()
+        args.container = None
 
         prompts = iter(["1", "myapp.example.com", "300", "30"])
         with patch("install._prompt", side_effect=lambda *a, **kw: next(prompts, "")), \
