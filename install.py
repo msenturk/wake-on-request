@@ -37,15 +37,15 @@ REPO = "msenturk/wake-on-request"
 BRANCH = "master"
 RAW_BASE = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}"
 
-# Directory where install.py itself lives — used to locate/place script files
-# regardless of where the user runs the script from or what --path is set to.
+# Directory where install.py itself lives — used for backup files etc.
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
-# local_path → container_path
-FILES: list[tuple[str, str]] = [
-    ("wakeonrequest.lua", "/data/nginx/custom/wakeonrequest.lua"),
-    ("npm-custom/http_top.conf", "/data/nginx/custom/http_top.conf"),
-    ("npm-custom/server_proxy.conf", "/data/nginx/custom/server_proxy.conf"),
+# GitHub source path → destination filename inside NPM's /data/nginx/custom/
+# Files are copied directly into the NPM data directory — no volume mounts needed.
+NGINX_CUSTOM_FILES: list[tuple[str, str]] = [
+    ("wakeonrequest.lua",       "wakeonrequest.lua"),
+    ("npm-custom/http_top.conf", "http_top.conf"),
+    # server_proxy.conf is bundled in SERVER_PROXY_CONF constant below
 ]
 VOL_SOCK = "/var/run/docker.sock:/var/run/docker.sock"
 
@@ -1036,62 +1036,49 @@ def run_dry_run(
 
     any_change = False
 
-    # ── Files ──────────────────────────────────────────────────────────────────
-    Console.section("Files")
-    for local_path, _ in FILES:
-        p = Path(local_path)
-        if not p.exists():
-            if local_path == "npm-custom/server_proxy.conf":
-                Console.change(f"Write     {local_path}   ← bundled in install.py")
+    # ── Files in NPM data/nginx/custom/ ────────────────────────────────────────
+    Console.section("Files in NPM data/nginx/custom/")
+    custom_dir = Path.cwd() / "data" / "nginx" / "custom"
+
+    all_dest_files = [(src, dest) for src, dest in NGINX_CUSTOM_FILES]
+    all_dest_files.append(("(bundled)", "server_proxy.conf"))
+
+    for src_path, dest_name in all_dest_files:
+        dest = custom_dir / dest_name
+        if not dest.exists():
+            if src_path == "(bundled)":
+                Console.change(f"Write     {dest_name}  ← bundled in install.py")
             else:
-                Console.change(f"Download  {local_path}   ← {RAW_BASE}/{p.name}")
+                Console.change(f"Download  {dest_name}  ← {RAW_BASE}/{src_path}")
             any_change = True
         else:
-            if local_path == "npm-custom/server_proxy.conf":
-                Console.ok(f"Exists    {local_path}")
+            if src_path == "(bundled)":
+                Console.ok(f"Exists    {dest_name}")
             else:
                 try:
-                    # Use local_path directly so nested directories resolve correctly on GitHub
-                    url = f"{RAW_BASE}/{local_path}"
+                    url = f"{RAW_BASE}/{src_path}"
                     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                     with urllib.request.urlopen(req, timeout=5) as resp:
                         remote_data = resp.read()
-                    # Normalize line endings before hashing to avoid spurious mismatches
-                    remote_data_norm = remote_data.replace(b'\r\n', b'\n')
-                    local_data_norm = p.read_bytes().replace(b'\r\n', b'\n')
-                    
-                    if hashlib.sha256(remote_data_norm).hexdigest() == hashlib.sha256(local_data_norm).hexdigest():
-                        Console.ok(f"Up-to-date  {local_path}")
+                    remote_norm = remote_data.replace(b'\r\n', b'\n')
+                    local_norm  = dest.read_bytes().replace(b'\r\n', b'\n')
+                    if hashlib.sha256(remote_norm).hexdigest() == hashlib.sha256(local_norm).hexdigest():
+                        Console.ok(f"Up-to-date  {dest_name}")
                     else:
-                        Console.warn(f"Outdated  {local_path}   ← update available")
+                        Console.warn(f"Outdated  {dest_name}  ← update available")
                         any_change = True
                 except Exception:
-                    Console.ok(f"Exists    {local_path}   (could not check remote)")
+                    Console.ok(f"Exists    {dest_name}  (could not check remote)")
 
-    # ── docker-compose.yml volumes ─────────────────────────────────────────────
+    # ── docker.sock volume (still needed for Docker API access) ─────────────────
     if Path("docker-compose.yml").exists():
-        Console.section("docker-compose.yml — Volume Changes")
+        Console.section("docker-compose.yml — docker.sock")
         patcher = ComposePatcher(Path("docker-compose.yml"))
-        compose_clean = True
-        for local_path, container_path in FILES:
-            vol = f"./{local_path}:{container_path}"
-            if not patcher.has_volume(vol):
-                Console.change(f"ADD  - {vol}")
-                compose_clean = False
-                any_change = True
-            else:
-                Console.ok(f"OK   - {vol}")
-
         if not patcher.has_volume(VOL_SOCK):
             Console.change(f"ADD  - {VOL_SOCK}")
-            compose_clean = False
             any_change = True
         else:
             Console.ok(f"OK   - {VOL_SOCK}")
-
-        if not compose_clean:
-            print()
-            Console.info("These lines will be inserted under your NPM service's 'volumes:' block.")
 
     # ── Container Label Status ─────────────────────────────────────────────────
     Console.section("Container Label Status")
@@ -1474,75 +1461,56 @@ def run_install(
     db: NpmDatabase,
 ) -> None:
     Console.banner("Wake-On-Request Installer")
-    print(f"  Directory (NPM): {Path.cwd()}")
-    print(f"  Script dir:      {SCRIPT_DIR}\n")
+    print(f"  NPM directory: {Path.cwd()}\n")
 
-    # ── Download files ─────────────────────────────────────────────────────────
-    Console.section("Downloading Files")
-    (SCRIPT_DIR / "npm-custom").mkdir(parents=True, exist_ok=True)
+    # ── Deploy files into NPM's data/nginx/custom/ ─────────────────────────────
+    Console.section("Deploying Files")
+    custom_dir = Path.cwd() / "data" / "nginx" / "custom"
+    custom_dir.mkdir(parents=True, exist_ok=True)
 
-    # Write bundled server_proxy.conf first
-    _write_bundled_server_proxy(SCRIPT_DIR / "npm-custom/server_proxy.conf")
-    Console.ok("Bundled   npm-custom/server_proxy.conf (no download needed)")
+    # Write bundled server_proxy.conf
+    _backup_file(custom_dir / "server_proxy.conf")
+    (custom_dir / "server_proxy.conf").write_text(SERVER_PROXY_CONF, encoding="utf-8")
+    Console.ok("Written   data/nginx/custom/server_proxy.conf  (bundled)")
 
-    for local_path, _ in FILES:
-        p = SCRIPT_DIR / local_path
-        if local_path == "npm-custom/server_proxy.conf":
-            continue  # already written above
-
-        remote_url = f"{RAW_BASE}/{local_path}"
-        _backup_file(p)
-        print(f"  Downloading {Console.bold(local_path)} ... ", end="", flush=True)
+    # Download wakeonrequest.lua and http_top.conf from GitHub
+    for src_path, dest_name in NGINX_CUSTOM_FILES:
+        dest = custom_dir / dest_name
+        remote_url = f"{RAW_BASE}/{src_path}"
+        _backup_file(dest)
+        print(f"  Downloading {Console.bold(dest_name)} ... ", end="", flush=True)
         try:
             with urllib.request.urlopen(remote_url, timeout=30) as resp:
-                tmp = p.with_suffix(".tmp")
+                tmp = dest.with_suffix(".tmp")
                 tmp.write_bytes(resp.read())
-                tmp.replace(p)
+                tmp.replace(dest)
             print(Console.green("done"))
         except Exception as exc:
             print(Console.red("FAILED"))
             Console.err(f"Could not download {remote_url}")
             Console.err(f"Error: {exc}")
             Console.err("Check your internet connection or download manually:")
-            Console.err(f"  curl -L {remote_url} -o {local_path}")
+            Console.err(f"  curl -L {remote_url} -o data/nginx/custom/{dest_name}")
             sys.exit(1)
 
-    Console.ok("All files ready.")
+    Console.ok("All files deployed to data/nginx/custom/.")
 
-    # ── Patch docker-compose.yml ───────────────────────────────────────────────
+    # ── Patch docker-compose.yml (docker.sock only) ────────────────────────────
     Console.section("Patching docker-compose.yml")
     patcher = ComposePatcher(Path("docker-compose.yml"))
 
-    # Volume source paths must be relative to the docker-compose.yml location (CWD).
-    # When --path is used, CWD is the NPM dir while script files live in SCRIPT_DIR.
-    try:
-        _vol_base = SCRIPT_DIR.relative_to(Path.cwd())
-    except ValueError:
-        # SCRIPT_DIR is not under CWD — use the absolute path instead
-        _vol_base = SCRIPT_DIR
-
-    volumes_needed = [
-        f"{_vol_base}/{local_path}:{container_path}"
-        for local_path, container_path in FILES
-        if not patcher.has_volume(f"{_vol_base}/{local_path}:{container_path}")
-        and not patcher.has_volume(f"./{local_path}:{container_path}")
-    ]
-    if not patcher.has_volume(VOL_SOCK):
-        volumes_needed.append(VOL_SOCK)
-
-    if volumes_needed:
-        if not patcher.validate():
-            Console.warn("docker-compose.yml is not valid YAML — showing manual instructions:")
-            _print_manual_volume_instructions(patcher, volumes_needed)
-        elif patcher.volumes_section_count() > 1:
-            Console.warn("Complex docker-compose.yml detected — showing manual instructions:")
-            _print_manual_volume_instructions(patcher, volumes_needed)
-        else:
-            patcher.backup()
-            patcher.add_volumes(volumes_needed)
-            Console.ok("docker-compose.yml patched.")
+    if patcher.has_volume(VOL_SOCK):
+        Console.ok("docker.sock already mounted — no changes needed.")
+    elif not patcher.validate():
+        Console.warn("docker-compose.yml is not valid YAML — add the following volume manually:")
+        print(f"      - {VOL_SOCK}")
+    elif patcher.volumes_section_count() > 1:
+        Console.warn("Complex docker-compose.yml — add the following volume manually:")
+        print(f"      - {VOL_SOCK}")
     else:
-        Console.ok("docker-compose.yml already configured — no changes needed.")
+        patcher.backup()
+        patcher.add_volumes([VOL_SOCK])
+        Console.ok("docker-compose.yml patched (docker.sock volume added).")
 
     # ── Clean NPM database snippets ────────────────────────────────────────────
     Console.section("Cleaning NPM Database")
@@ -1569,22 +1537,22 @@ def run_install(
     print(f"  {Console.bold('Next Steps:')}")
     print()
     print(f"  {Console.bold('1.')} Restart NPM to load Wake-On-Request:")
-    print(f"     {Console.blue('docker compose up -d')}")
+    print(f"     {Console.blue('docker compose restart')}")
     print()
-    print(f"  {Console.bold('2.')} For each app, add labels to its docker-compose.yml:")
+    print(f"  {Console.bold('2.')} For each app container, add Docker labels:")
     print()
     print(f"     {Console.green('labels:')}")
     print("     " + Console.green('  - "wakeonrequest.enable=true"') + "             " + Console.blue('# required'))
     print("     " + Console.green('  - "wakeonrequest.domain=yourapp.example.com"') + "   " + Console.blue('# required'))
     print("     " + Console.green('  - "wakeonrequest.idle_timeout=300"') + "             " + Console.blue('# optional'))
     print("     " + Console.green('  - "wakeonrequest.start_timeout=30"') + "             " + Console.blue('# optional'))
-    print("     " + Console.yellow('  restart: "no"') + "                                  " + Console.blue('# required \u2014 allows idle stop'))
+    print("     " + Console.yellow('  restart: "no"') + "                                  " + Console.blue('# required — allows idle stop'))
     print()
     print(f"  {Console.bold('3.')} Recreate the app container:")
     print(f"     {Console.blue('docker compose up -d --force-recreate your-app')}")
     print()
     print(f"  {Console.bold('4.')} Run dry-run anytime to check status:")
-    print(f"     {Console.blue('./install.sh --dry-run')}")
+    print(f"     {Console.blue('./install.py --dry-run')}")
     print()
 
 

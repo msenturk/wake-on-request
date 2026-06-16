@@ -1304,7 +1304,7 @@ class TestRunDryRun:
         I.run_dry_run(args, docker, db)
 
         out = capsys.readouterr().out
-        assert "Volume Changes" in out
+        assert "docker.sock" in out
 
     def test_dry_run_configured_container(self, tmp_dir, npm_compose, capsys):
         docker = MagicMock()
@@ -1526,13 +1526,10 @@ class TestRunInstall:
         assert "wakeonrequest.lua" in compose_text or "docker.sock" in compose_text
 
     def test_install_already_patched(self, tmp_dir, capsys):
-        # Write a compose that already has all volumes
+        # Write a compose that already has docker.sock volume
         compose = tmp_dir / "docker-compose.yml"
-        vols = "\n".join(
-            f"      - ./{lp}:{cp}" for lp, cp in I.FILES
-        )
         compose.write_text(
-            f"services:\n  app:\n    image: test\n    volumes:\n{vols}\n"
+            f"services:\n  app:\n    image: test\n    volumes:\n"
             f"      - {I.VOL_SOCK}\n"
         )
 
@@ -1542,18 +1539,25 @@ class TestRunInstall:
         db.clear_old_snippets.return_value = 0
         args = MagicMock()
 
-        # Pre-create all files so no download needed
-        for lp, _ in I.FILES:
-            p = tmp_dir / lp
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text("content")
+        # Pre-create all nginx custom files so no download is attempted
+        custom_dir = tmp_dir / "data" / "nginx" / "custom"
+        custom_dir.mkdir(parents=True, exist_ok=True)
+        for _, dest_name in I.NGINX_CUSTOM_FILES:
+            (custom_dir / dest_name).write_text("content")
+        (custom_dir / "server_proxy.conf").write_text("content")
 
-        with patch("sys.stdin") as mock_stdin:
+        with patch("urllib.request.urlopen") as mock_urlopen, \
+             patch("sys.stdin") as mock_stdin:
             mock_stdin.isatty.return_value = False
+            mock_response = MagicMock()
+            mock_response.read.return_value = b"content"
+            mock_response.__enter__ = lambda s: s
+            mock_response.__exit__ = MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_response
             I.run_install(args, docker, db)
 
         out = capsys.readouterr().out
-        assert "already configured" in out or "no changes needed" in out
+        assert "already mounted" in out or "no changes needed" in out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
