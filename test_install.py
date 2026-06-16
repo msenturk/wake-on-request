@@ -1107,7 +1107,9 @@ class TestUtilities:
 
     def test_prompt_keyboard_interrupt(self):
         with patch("builtins.input", side_effect=KeyboardInterrupt):
-            assert I._prompt("Test: ", default="x") == "x"
+            with pytest.raises(SystemExit) as excinfo:
+                I._prompt("Test: ", default="x")
+            assert excinfo.value.code == 1
 
 
 import re  # needed for test_is_ip_valid pattern assertions above
