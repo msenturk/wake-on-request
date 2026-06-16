@@ -1567,23 +1567,35 @@ def run_install(
     custom_dir = Path.cwd() / "data" / "nginx" / "custom"
     custom_dir.mkdir(parents=True, exist_ok=True)
 
+    files_changed = False
+
     # Write bundled server_proxy.conf
-    _backup_file(custom_dir / "server_proxy.conf")
-    (custom_dir / "server_proxy.conf").write_text(SERVER_PROXY_CONF, encoding="utf-8")
-    Console.ok("Written   data/nginx/custom/server_proxy.conf  (bundled)")
+    target_sp = custom_dir / "server_proxy.conf"
+    if not target_sp.exists() or target_sp.read_text(encoding="utf-8") != SERVER_PROXY_CONF:
+        _backup_file(target_sp)
+        target_sp.write_text(SERVER_PROXY_CONF, encoding="utf-8")
+        Console.ok("Written   data/nginx/custom/server_proxy.conf  (bundled)")
+        files_changed = True
+    else:
+        Console.ok("Up-to-date data/nginx/custom/server_proxy.conf")
 
     # Download wakeonrequest.lua and http_top.conf from GitHub
     for src_path, dest_name in NGINX_CUSTOM_FILES:
         dest = custom_dir / dest_name
         remote_url = f"{RAW_BASE}/{src_path}"
-        _backup_file(dest)
-        print(f"  Downloading {Console.bold(dest_name)} ... ", end="", flush=True)
+        print(f"  Checking {Console.bold(dest_name)} ... ", end="", flush=True)
         try:
             with urllib.request.urlopen(remote_url, timeout=30) as resp:
-                tmp = dest.with_suffix(".tmp")
-                tmp.write_bytes(resp.read())
-                tmp.replace(dest)
-            print(Console.green("done"))
+                new_data = resp.read()
+                if dest.exists() and dest.read_bytes() == new_data:
+                    print(Console.green("up-to-date"))
+                else:
+                    _backup_file(dest)
+                    tmp = dest.with_suffix(".tmp")
+                    tmp.write_bytes(new_data)
+                    tmp.replace(dest)
+                    print(Console.green("downloaded and updated"))
+                    files_changed = True
         except Exception as exc:
             print(Console.red("FAILED"))
             Console.err(f"Could not download {remote_url}")
@@ -1597,6 +1609,7 @@ def run_install(
     # ── Patch docker-compose.yml (docker.sock only) ────────────────────────────
     Console.section("Patching docker-compose.yml")
     patcher = ComposePatcher(Path("docker-compose.yml"))
+    compose_patched = False
 
     if patcher.has_volume(VOL_SOCK):
         Console.ok("docker.sock already mounted — no changes needed.")
@@ -1610,6 +1623,7 @@ def run_install(
         patcher.backup()
         patcher.add_volumes([VOL_SOCK])
         Console.ok("docker-compose.yml patched (docker.sock volume added).")
+        compose_patched = True
 
     # ── Clean NPM database snippets ────────────────────────────────────────────
     Console.section("Cleaning NPM Database")
@@ -1634,16 +1648,27 @@ def run_install(
     print()
     Console.banner("✨ Installation Complete!", color=Console._BOLD + Console._GREEN)
     print()
-    print(f"  {Console.bold('Next Steps:')}")
-    print()
-    print(f"  {Console.bold('1.')} Recreate NPM to load Wake-On-Request {Console.yellow('(Required ONCE)')}:")
-    print(f"     {Console.blue('docker compose up -d --force-recreate npm')}")
-    _npm_hint = Console.blue('# (use your NPM service name if different from "npm")')
-    print(f"     {_npm_hint}")
-    print()
+    
+    show_step1 = compose_patched or files_changed
+    show_method_a = "A" in methods_used or not methods_used
+    
+    if show_step1 or show_method_a:
+        print(f"  {Console.bold('Next Steps:')}")
+        print()
+    else:
+        print(f"  {Console.bold('No further action required.')} Your containers are configured.")
+        print()
 
-    if "A" in methods_used or not methods_used:
-        print(f"  {Console.bold('2.')} If using {Console.bold('Method A')} (Docker Labels), update your app's compose file:")
+    if show_step1:
+        print(f"  {Console.bold('1.')} Recreate NPM to load Wake-On-Request {Console.yellow('(Required ONCE)')}:")
+        print(f"     {Console.blue('docker compose up -d --force-recreate npm')}")
+        _npm_hint = Console.blue('# (use your NPM service name if different from "npm")')
+        print(f"     {_npm_hint}")
+        print()
+
+    if show_method_a:
+        step_num = "2" if show_step1 else "1"
+        print(f"  {Console.bold(step_num + '.')} If using {Console.bold('Method A')} (Docker Labels), update your app's compose file:")
         print()
         _restart = Console.green('restart: "no"')
         _req = Console.blue('# required — allows idle stop')
@@ -1652,13 +1677,16 @@ def run_install(
         print("       " + Console.green('- "wakeonrequest.enable=true"') + "           " + Console.blue('# required'))
         print("       " + Console.green('- "wakeonrequest.domain=yourapp.example.com"') + " " + Console.blue('# required'))
         print("       " + Console.green('- "wakeonrequest.idle_timeout=300"') + "           " + Console.blue('# optional, seconds'))
-        print("       " + Console.green('- "wakeonrequest.start_timeout=30"') + "           " + Console.blue('# optional, seconds'))
+        print(f"       " + Console.green('- "wakeonrequest.start_timeout=30"') + "           " + Console.blue('# optional, seconds'))
         print()
-        print(f"  {Console.bold('3.')} If using labels, recreate the app container to apply them:")
+        
+        step3_num = "3" if show_step1 else "2"
+        print(f"  {Console.bold(step3_num + '.')} If using labels, recreate the app container to apply them:")
         print(f"     {Console.blue('docker compose up -d --force-recreate <your-app-service>')}")
         print()
 
-    print(f"  {Console.bold('4.')} Run dry-run anytime to check status:")
+    step_final = "4" if (show_step1 and show_method_a) else ("3" if (show_step1 or show_method_a) else "1")
+    print(f"  {Console.bold(step_final + '.')} Run dry-run anytime to check status:")
     print(f"     {Console.blue('./install.py --dry-run')}")
     print()
 
