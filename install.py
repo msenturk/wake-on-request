@@ -299,7 +299,13 @@ class DockerClient:
                 timeout=timeout,
             )
             return r.stdout
-        except Exception:
+        except subprocess.TimeoutExpired:
+            Console.warn(f"Docker command timed out: {args}")
+            return ""
+        except FileNotFoundError:
+            return ""  # runtime not installed, expected
+        except Exception as exc:
+            Console.warn(f"Docker command failed: {exc}")
             return ""
 
     def run_exec(self, container_id: str, args: list[str]) -> str:
@@ -406,6 +412,12 @@ class NpmDatabase:
         self._db_override = db_override  # explicit sqlite file path from --path
         self._proxy_hosts: list[dict] = []  # [{domain_names, forward_host, forward_port}]
         self._fetched = False
+        self._npm_cid: Optional[str] = None
+
+    def _get_npm_cid(self) -> str:
+        if self._npm_cid is None:
+            self._npm_cid = self._docker.find_npm_container() if self._docker.available else ""
+        return self._npm_cid
 
     def _query_at(self, db_path: Path, sql: str, params: tuple = ()) -> list[tuple]:
         """Run SQL directly against a local SQLite file."""
@@ -461,11 +473,16 @@ class NpmDatabase:
     def _exec_query(self, npm_cid: str, sql: str) -> list[tuple]:
         """Run SQL against the NPM database via container exec.
 
+        SECURITY:
+          - SQL must be a string literal with no external interpolation.
+          - Use Python-side filtering of results, never SQL WHERE clauses with user data.
+
         Tries in order:
           1. python3 inside the NPM container
           2. sqlite3 CLI inside the NPM container
           3. Throwaway Alpine container with --volumes-from (named-volume fallback)
         """
+        assert '"' not in sql and "$" not in sql and "`" not in sql, "SQL must be a constant literal without double quotes or shell metachars"
         sep = "\x1e"  # ASCII Record Separator — never appears in SQL text output
 
         # Strategy 1: python3 (present in jc21/nginx-proxy-manager images)
@@ -490,15 +507,28 @@ class NpmDatabase:
         return self._query_via_temp_container(npm_cid, sql, sep)
 
     def _query_via_temp_container(self, npm_cid: str, sql: str, sep: str = "\x1e") -> list[tuple]:
-        """Spin up a minimal Alpine container with --volumes-from <npm_cid> and run sqlite3."""
+        """Spin up a minimal, hardened throwaway container to run sqlite3.
+        
+        Uses the exact same image as the NPM container to ensure sqlite3 is present
+        without requiring outbound network access or root filesystem writes.
+        """
         if not self._docker.available:
             return []
+            
+        npm_image = self._docker.run(["inspect", "--format", "{{.Image}}", npm_cid]).strip()
+        if not npm_image:
+            return []
+            
         cmd = self._docker._cmd + [
             "run", "--rm",
+            "--network", "none",
+            "--read-only",
+            "--cap-drop", "ALL",
             "--volumes-from", npm_cid,
-            "alpine:3.20",
-            "sh", "-c",
-            f"apk add --no-cache sqlite >/dev/null 2>&1 && sqlite3 -separator '{sep}' /data/database.sqlite \"{sql}\"",
+            "--entrypoint", "sh",
+            npm_image,
+            "-c",
+            f"sqlite3 -separator '{sep}' /data/database.sqlite \"{sql}\"",
         ]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -510,6 +540,12 @@ class NpmDatabase:
         return []
 
     def _exec_write(self, npm_cid: str, sql: str) -> int:
+        """Execute a write SQL query inside the NPM container.
+        
+        SECURITY:
+          - SQL must be a string literal with no external interpolation.
+        """
+        assert '"' not in sql and "$" not in sql and "`" not in sql, "SQL must be a constant literal without double quotes or shell metachars"
         py_cmd = (
             "import sqlite3; conn=sqlite3.connect('/data/database.sqlite'); "
             f"cur=conn.execute({sql!r}); conn.commit(); print(cur.rowcount)"
@@ -537,7 +573,7 @@ class NpmDatabase:
         if self._fetched:
             return
         self._fetched = True
-        npm_cid = self._docker.find_npm_container() if self._docker.available else ""
+        npm_cid = self._get_npm_cid()
         sql = "SELECT domain_names, forward_host, forward_port FROM proxy_host WHERE is_deleted=0"
 
         rows: list[tuple] = []
@@ -616,7 +652,7 @@ class NpmDatabase:
         return None
 
     def count_old_snippets(self) -> Optional[int]:
-        npm_cid = self._docker.find_npm_container() if self._docker.available else ""
+        npm_cid = self._get_npm_cid()
         sql = "SELECT COUNT(*) FROM proxy_host WHERE advanced_config LIKE '%wakeonrequest%'"
         if npm_cid:
             rows = self._exec_query(npm_cid, sql)
@@ -634,7 +670,7 @@ class NpmDatabase:
         return None
 
     def clear_old_snippets(self) -> Optional[int]:
-        npm_cid = self._docker.find_npm_container() if self._docker.available else ""
+        npm_cid = self._get_npm_cid()
         sql = "UPDATE proxy_host SET advanced_config = '' WHERE advanced_config LIKE '%wakeonrequest%'"
         if npm_cid:
             n = self._exec_write(npm_cid, sql)
@@ -794,45 +830,48 @@ class ComposePatcher:
     ) -> bool:
         """
         Add wakeonrequest labels under a named service. Returns True if changed.
-        Uses a safe regex approach that preserves all formatting.
+        Safe fallback: if YAML module available, round-trip parse;
+        otherwise display instructions rather than risk corrupting the file.
         """
         text = self.path.read_text()
-
         if "wakeonrequest.enable" in text:
             return False  # Already configured
 
-        # Find the service block
-        svc_pattern = re.compile(
-            r"(^  " + re.escape(service_name) + r":.*?\n)", re.MULTILINE
-        )
-        match = svc_pattern.search(text)
-        if not match:
-            return False
+        try:
+            import importlib
+            yaml = importlib.import_module("yaml")
+        except ImportError:
+            return False  # Force manual fallback if yaml module missing
 
-        # Check if this service already has a labels: block
-        svc_start = match.end()
-        # Find where the next service starts (4-space dedent)
-        next_svc = re.search(r"^\S|\n  \S", text[svc_start:], re.MULTILINE)
-        svc_block = text[svc_start: svc_start + (next_svc.start() if next_svc else len(text))]
+        try:
+            with self.path.open() as f:
+                data = yaml.safe_load(f)
 
-        label_lines = "".join('      - "' + lbl + '"\n' for lbl in labels)
+            if not data or "services" not in data or service_name not in data["services"]:
+                return False
 
-        if re.search(r"^\s{4,}labels:", svc_block, re.MULTILINE):
-            # Append to existing labels block
-            labels_match = re.search(r"(\s{4,}labels:\s*\n)", text[svc_start:])
-            if labels_match:
-                insert_pos = svc_start + labels_match.end()
-                text = text[:insert_pos] + label_lines + text[insert_pos:]
-                self.path.write_text(text)
-                return True
-        else:
-            # Insert a new labels block after service name line
-            insert_pos = match.end()
-            text = text[:insert_pos] + "    labels:\n" + label_lines + text[insert_pos:]
-            self.path.write_text(text)
+            svc = data["services"][service_name]
+            if "labels" not in svc:
+                svc["labels"] = []
+
+            # labels can be dict or list in compose, handle both
+            if isinstance(svc["labels"], list):
+                for lbl in labels:
+                    if lbl not in svc["labels"]:
+                        svc["labels"].append(lbl)
+            elif isinstance(svc["labels"], dict):
+                for lbl in labels:
+                    k, v = lbl.split("=", 1) if "=" in lbl else (lbl, "")
+                    svc["labels"][k] = v
+            else:
+                return False
+
+            # Dump with PyYAML (sort_keys=False preserves key order in Py3.7+)
+            with self.path.open("w") as f:
+                yaml.dump(data, f, default_flow_style=False, sort_keys=False)
             return True
-
-        return False
+        except Exception:
+            return False
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
