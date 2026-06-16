@@ -702,8 +702,14 @@ class NpmDatabase:
         """Inject `snippet` into the NPM advanced_config column for the proxy host
         matching `domain`. Uses parameterized queries to prevent SQL injection.
         Returns the number of rows updated, or None on failure.
+
+        After the DB write, also patches the live nginx config file and reloads
+        nginx so the change takes effect immediately — no NPM UI save needed.
         """
         npm_cid = self._get_npm_cid()
+
+        rows_updated: Optional[int] = None
+        host_id: Optional[int] = None
 
         # Strategy 1: direct local SQLite file (safest — no shell involved)
         db_path = self._find_npm_db_via_inspect(npm_cid) if npm_cid else None
@@ -713,24 +719,36 @@ class NpmDatabase:
             Console.info(f"Writing to NPM database at {db_path} ...")
             try:
                 with sqlite3.connect(str(db_path)) as conn:
+                    # Fetch the proxy host ID so we can locate its nginx config file
+                    row = conn.execute(
+                        "SELECT id FROM proxy_host WHERE is_deleted = 0 AND domain_names LIKE ?",
+                        (f'%{domain}%',),
+                    ).fetchone()
+                    if row:
+                        host_id = int(row[0])
                     cur = conn.execute(
                         "UPDATE proxy_host SET advanced_config = ? "
                         "WHERE is_deleted = 0 AND domain_names LIKE ?",
                         (snippet, f'%{domain}%'),
                     )
                     conn.commit()
-                    return cur.rowcount
+                    rows_updated = cur.rowcount
             except Exception as exc:
                 Console.warn(f"Direct DB write failed: {exc}")
 
         # Strategy 2: docker exec python3 using a proper parameterized script
-        if npm_cid:
+        if rows_updated is None and npm_cid:
             Console.info(f"Writing via docker exec into container {npm_cid[:12]} ...")
             py_script = (
                 "import sqlite3\n"
                 "conn = sqlite3.connect('/data/database.sqlite')\n"
                 f"snippet = {snippet!r}\n"
                 f"domain  = {domain!r}\n"
+                "row = conn.execute(\n"
+                "    'SELECT id FROM proxy_host WHERE is_deleted=0 AND domain_names LIKE ?',\n"
+                "    ('%' + domain + '%',)\n"
+                ").fetchone()\n"
+                "if row: print('ID:' + str(row[0]))\n"
                 "cur = conn.execute(\n"
                 "    'UPDATE proxy_host SET advanced_config=?'\n"
                 "    ' WHERE is_deleted=0 AND domain_names LIKE ?',\n"
@@ -741,14 +759,91 @@ class NpmDatabase:
             )
             out = self._docker.run_exec(npm_cid, ["python3", "-c", py_script])
             if out and out.strip():
-                try:
-                    return int(out.strip())
-                except ValueError:
-                    Console.warn(f"Unexpected output from docker exec: {out.strip()!r}")
+                for line in out.strip().splitlines():
+                    if line.startswith("ID:"):
+                        try:
+                            host_id = int(line[3:])
+                        except ValueError:
+                            pass
+                    else:
+                        try:
+                            rows_updated = int(line.strip())
+                        except ValueError:
+                            Console.warn(f"Unexpected output from docker exec: {line!r}")
             else:
                 Console.warn("docker exec returned no output — python3 may not be available in the NPM container.")
 
-        return None
+        # ── Patch the live nginx config file + reload nginx ────────────────────
+        # NPM doesn't regenerate its nginx config files when the DB is written
+        # directly (bypassing the NPM API). We patch the file ourselves and
+        # reload nginx so the change is instant — no NPM restart needed.
+        if host_id is not None and rows_updated:
+            self._patch_nginx_conf(host_id, snippet, npm_cid)
+
+        return rows_updated
+
+    def _patch_nginx_conf(self, host_id: int, snippet: str, npm_cid: str) -> None:
+        """Write `snippet` into the live nginx proxy host config file and reload nginx."""
+        # Determine the nginx config file path on the host filesystem
+        nginx_conf: Optional[Path] = None
+        db_path = self._find_npm_db_via_inspect(npm_cid) if npm_cid else None
+        if db_path:
+            # data dir is the parent of database.sqlite (or its parent if nested)
+            data_dir = db_path.parent
+            if data_dir.name == "data":
+                data_dir = data_dir  # already at /data
+            nginx_conf = data_dir / "nginx" / "proxy_host" / f"{host_id}.conf"
+
+        if not nginx_conf:
+            # Fallback: look relative to CWD (the --path target dir)
+            nginx_conf = Path.cwd() / "data" / "nginx" / "proxy_host" / f"{host_id}.conf"
+
+        if not nginx_conf or not nginx_conf.exists():
+            Console.warn(
+                f"Could not find nginx config for proxy host {host_id} "
+                f"— nginx reload skipped. Changes will apply after NPM restart."
+            )
+            return
+
+        try:
+            original = nginx_conf.read_text(encoding="utf-8")
+
+            # Remove any existing wakeonrequest snippet first (idempotent)
+            import re as _re
+            cleaned = _re.sub(
+                r'\n?# wake-on-request begin.*?# wake-on-request end\n?',
+                '',
+                original,
+                flags=_re.DOTALL,
+            )
+
+            # Insert before the first `location` block
+            tagged = f"\n# wake-on-request begin\n{snippet.strip()}\n# wake-on-request end\n"
+            if 'location ' in cleaned:
+                patched = cleaned.replace(
+                    cleaned[cleaned.index('location '):],
+                    tagged + cleaned[cleaned.index('location '):],
+                    1,
+                )
+            else:
+                patched = cleaned + tagged
+
+            nginx_conf.write_text(patched, encoding="utf-8")
+            Console.ok(f"Nginx config patched: data/nginx/proxy_host/{host_id}.conf")
+        except Exception as exc:
+            Console.warn(f"Could not patch nginx config file: {exc}")
+            return
+
+        # Reload nginx inside the NPM container
+        if npm_cid:
+            out = self._docker.run_exec(npm_cid, ["nginx", "-s", "reload"])
+            if out is not None:
+                Console.ok("Nginx reloaded — advanced config is live immediately.")
+            else:
+                Console.warn("nginx reload failed — changes apply after next NPM restart.")
+        else:
+            Console.info("Nginx reload skipped (no NPM container found). Restart NPM to apply.")
+
 
 
 # ── Compose File Resolver ──────────────────────────────────────────────────────

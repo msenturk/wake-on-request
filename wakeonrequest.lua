@@ -216,7 +216,7 @@ local SPLASH_TEMPLATE = [[
 ]]
 
 local function html_escape(s)
-    return s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;")
+    return (s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"):gsub("'", "&#39;"))
 end
 
 local function render_splash(name)
